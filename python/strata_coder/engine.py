@@ -374,20 +374,42 @@ def gpu_moe_forward(
     flat_e = topk_idx.view(-1)
 
     if cache_mgr is not None and _HAS_TRITON and nrm.is_cuda:
-        ptrs = cache_mgr.get_experts_batch_ptrs_gpu(flat_e)
-        if T == 1:
-            flat_t_i64 = torch.zeros(K, device=device, dtype=torch.int64)
+        if T <= 8:
+            ptrs = cache_mgr.get_experts_batch_ptrs_gpu(flat_e)
+            if T == 1:
+                flat_t_i64 = torch.zeros(K, device=device, dtype=torch.int64)
+            else:
+                flat_t_i64 = torch.arange(T, device=device, dtype=torch.int64).unsqueeze(1).expand(T, K).reshape(-1)
+            u = sc_lut_batched_experts_mlp(
+                z=z,
+                ptrs=ptrs,
+                flat_w=topk_w.view(-1).contiguous(),
+                flat_t=flat_t_i64,
+                luts_T_f32=cache_mgr.luts_T_f32,
+                qb_T_f32=cache_mgr.qb_T_f32,
+                qb_T_stack=cache_mgr.qb_T_stack,
+            )
         else:
-            flat_t_i64 = torch.arange(T, device=device, dtype=torch.int64).unsqueeze(1).expand(T, K).reshape(-1)
-        u = sc_lut_batched_experts_mlp(
-            z=z,
-            ptrs=ptrs,
-            flat_w=topk_w.view(-1).contiguous(),
-            flat_t=flat_t_i64,
-            luts_T_f32=cache_mgr.luts_T_f32,
-            qb_T_f32=cache_mgr.qb_T_f32,
-            qb_T_stack=cache_mgr.qb_T_stack,
-        )
+            u_chunks = []
+            chunk_t = 8
+            for t0 in range(0, T, chunk_t):
+                t1 = min(t0 + chunk_t, T)
+                tc = t1 - t0
+                sub_e = topk_idx[t0:t1].reshape(-1)
+                sub_w = topk_w[t0:t1].reshape(-1).contiguous()
+                ptrs = cache_mgr.get_experts_batch_ptrs_gpu(sub_e)
+                flat_t_i64 = torch.arange(tc, device=device, dtype=torch.int64).unsqueeze(1).expand(tc, K).reshape(-1)
+                u_c = sc_lut_batched_experts_mlp(
+                    z=z[t0:t1],
+                    ptrs=ptrs,
+                    flat_w=sub_w,
+                    flat_t=flat_t_i64,
+                    luts_T_f32=cache_mgr.luts_T_f32,
+                    qb_T_f32=cache_mgr.qb_T_f32,
+                    qb_T_stack=cache_mgr.qb_T_stack,
+                )
+                u_chunks.append(u_c)
+            u = torch.cat(u_chunks, dim=0)
         y = _mm(gpu_rmsnorm(u, lat_nw, 1e-5), lat_up)
         return y + sh_out
 

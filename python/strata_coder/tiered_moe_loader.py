@@ -355,7 +355,7 @@ class TieredMoECacheManager:
             for suffix in ("idx_packed", "scales", "u_svd", "v_svd"):
                 k = f"{epfx}{proj}.{suffix}"
                 t = self.get_tensor(k)
-                if suffix in ("u_svd", "v_svd") and t.dtype != torch.float16:
+                if suffix in ("scales", "u_svd", "v_svd") and t.dtype != torch.float16:
                     t = t.float().clamp(-65504.0, 65504.0).to(torch.float16)
                 out[f"{proj}.{suffix}"] = t.to(target_dev, non_blocking=True)
         return out
@@ -501,7 +501,7 @@ class TieredMoECacheManager:
             for proj in ("w1", "w2", "w3"):
                 for suffix in ("idx_packed", "scales", "u_svd", "v_svd"):
                     t = loaded[f"{epfx}{proj}.{suffix}"]
-                    if suffix in ("u_svd", "v_svd") and t.dtype != torch.float16:
+                    if suffix in ("scales", "u_svd", "v_svd") and t.dtype != torch.float16:
                         t = t.float().clamp(-65504.0, 65504.0).to(torch.float16)
                     entry[f"{proj}.{suffix}"] = t
             self.prefetch_buffer[e] = entry
@@ -516,23 +516,36 @@ class TieredMoECacheManager:
         if len(self._vram_ptr_ready) == len(self.expert_tiers):
             return self.expert_ptr_table.index_select(0, flat_e).contiguous()
         e_list = flat_e.tolist()
-        missing = [e for e in set(e_list) if e not in self._vram_ptr_ready]
-        if missing:
-            self.warm_experts_parallel(missing)
-            upd_idxs = []
-            upd_rows = []
-            for e in missing:
-                raw, _, _, _, _ = self.get_expert_raw_gpu(e)
-                if e in self.vram_cache:
-                    self._vram_ptr_ready.add(e)
-                else:
-                    self._last_batch_keepalive.append(raw)
-                upd_idxs.append(e)
-                upd_rows.append(self._make_ptr_row(e, raw))
-            self.expert_ptr_table[torch.tensor(upd_idxs, dtype=torch.long, device=self.device)] = torch.tensor(
-                upd_rows, dtype=torch.int64, device=self.device
+        missing = [e for e in dict.fromkeys(e_list) if e not in self._vram_ptr_ready]
+        if not missing:
+            return self.expert_ptr_table.index_select(0, flat_e).contiguous()
+        self.warm_experts_parallel(missing)
+        upd_vram_idxs = []
+        upd_vram_rows = []
+        temp_rows: Dict[int, List[int]] = {}
+        for e in missing:
+            raw, _, _, _, _ = self.get_expert_raw_gpu(e)
+            row = self._make_ptr_row(e, raw)
+            if e in self.vram_cache:
+                self._vram_ptr_ready.add(e)
+                upd_vram_idxs.append(e)
+                upd_vram_rows.append(row)
+            else:
+                self._last_batch_keepalive.append(raw)
+                temp_rows[e] = row
+        if upd_vram_idxs:
+            self.expert_ptr_table[torch.tensor(upd_vram_idxs, dtype=torch.long, device=self.device)] = torch.tensor(
+                upd_vram_rows, dtype=torch.int64, device=self.device
             )
-        return self.expert_ptr_table.index_select(0, flat_e).contiguous()
+        if not temp_rows:
+            return self.expert_ptr_table.index_select(0, flat_e).contiguous()
+        out = self.expert_ptr_table.index_select(0, flat_e).contiguous()
+        t_idxs = [i for i, e in enumerate(e_list) if e in temp_rows]
+        t_vals = [temp_rows[e_list[i]] for i in t_idxs]
+        out[torch.tensor(t_idxs, dtype=torch.long, device=self.device)] = torch.tensor(
+            t_vals, dtype=torch.int64, device=self.device
+        )
+        return out
 
     @torch.no_grad()
     def stage_expert_to_gpu_async(self, e: int):

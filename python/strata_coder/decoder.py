@@ -409,6 +409,8 @@ def sc_lut_linear(
         dotlut = build_dotlut(xf, lut, q_basis)
 
     if _HAS_TRITON and x.is_cuda and bits in (9, 10):
+        if scales.dtype != torch.float16:
+            scales = scales.to(torch.float16)
         BLOCK_R = 64
         if bits == 10:
             n_blocks = idx_packed.shape[1] // 5
@@ -488,6 +490,10 @@ def sc_lut_expert_mlp(
     R = w1_u.shape[0]
 
     if _HAS_TRITON and z_e.is_cuda and bits in (9, 10):
+        if w1_s.dtype != torch.float16:
+            w1_s = w1_s.to(torch.float16)
+        if w3_s.dtype != torch.float16:
+            w3_s = w3_s.to(torch.float16)
         BLOCK_R = 64
         if bits == 10:
             n_blocks = w1_p.shape[1] // 5
@@ -656,6 +662,7 @@ if _HAS_TRITON:
         dotlut1_ptr,
         dotlut2_ptr,
         dotlut3_ptr,
+        tok_ids_ptr,
         out1_ptr,
         out3_ptr,
         R: tl.constexpr,
@@ -670,13 +677,13 @@ if _HAS_TRITON:
 
         tier = tl.load(ptrs_ptr + pid_e * 14 + 12).to(tl.int32)
         w1_packed_ptr = tl.load(ptrs_ptr + pid_e * 14 + 0).to(tl.pointer_type(tl.uint8))
-        w1_scales_ptr = tl.load(ptrs_ptr + pid_e * 14 + 1).to(tl.pointer_type(tl.float8e4nv))
+        w1_scales_ptr = tl.load(ptrs_ptr + pid_e * 14 + 1).to(tl.pointer_type(tl.float16))
         w3_packed_ptr = tl.load(ptrs_ptr + pid_e * 14 + 4).to(tl.pointer_type(tl.uint8))
-        w3_scales_ptr = tl.load(ptrs_ptr + pid_e * 14 + 5).to(tl.pointer_type(tl.float8e4nv))
+        w3_scales_ptr = tl.load(ptrs_ptr + pid_e * 14 + 5).to(tl.pointer_type(tl.float16))
 
         acc1 = tl.zeros([BLOCK_R], dtype=tl.float32)
         acc3 = tl.zeros([BLOCK_R], dtype=tl.float32)
-        dl_e = 0 if SHARED_X else tl.load(ptrs_ptr + pid_e * 14 + 12) * 0 + pid_e
+        dl_e = 0 if SHARED_X else tl.load(tok_ids_ptr + pid_e)
 
         if tier == 1:
             packed_stride = 224 * 5
@@ -790,7 +797,7 @@ if _HAS_TRITON:
 
         tier = tl.load(ptrs_ptr + pid_e * 14 + 12).to(tl.int32)
         w2_packed_ptr = tl.load(ptrs_ptr + pid_e * 14 + 8).to(tl.pointer_type(tl.uint8))
-        w2_scales_ptr = tl.load(ptrs_ptr + pid_e * 14 + 9).to(tl.pointer_type(tl.float8e4nv))
+        w2_scales_ptr = tl.load(ptrs_ptr + pid_e * 14 + 9).to(tl.pointer_type(tl.float16))
         w_tok = tl.load(w_tok_ptr + pid_e)
         tok_id = tl.load(tok_ids_ptr + pid_e)
 
@@ -873,45 +880,53 @@ def sc_lut_batched_experts_mlp(
     E = ptrs.shape[0]
     device = z.device
     zf = z.float().contiguous()
-    z_in = zf if T == 1 else zf.index_select(0, flat_t).contiguous()
-    z_blocks = z_in.view(-1, 56, 64)
-    dl1 = ((z_blocks @ qb_T_f32[1]).view(-1, 896, 4) @ luts_T_f32[1]).contiguous()
-    dl2 = ((z_blocks @ qb_T_f32[2]).view(-1, 896, 4) @ luts_T_f32[2]).contiguous()
-    dl3 = ((z_blocks @ qb_T_f32[3]).view(-1, 448, 8) @ luts_T_f32[3]).contiguous()
-
-    tiers_e = ptrs[:, 12]
-    v1_tmp = torch.empty((E, 16), device=device, dtype=torch.float32)
-    v3_tmp = torch.empty((E, 16), device=device, dtype=torch.float32)
-    g1 = torch.empty((E, 3072), device=device, dtype=torch.float32)
-    u3 = torch.empty((E, 3072), device=device, dtype=torch.float32)
-    _batched_svd_v_kernel[(16, E)](
-        z_in, ptrs, 3, 7, v1_tmp, v3_tmp, C=3584, SHARED_X=(T == 1), DUAL=True, BLOCK_C=512, num_warps=4
-    )
-    _batched_svd_u_kernel[(48, E)](
-        v1_tmp, v3_tmp, ptrs, 2, 6, g1, u3, R=3072, DUAL=True, BLOCK_R=64, num_warps=4
-    )
-    _batched_sc_lut_w13_dotlut_splitk_kernel[(48, 28, E)](
-        ptrs, dl1, dl2, dl3, g1, u3, R=3072, SHARED_X=(T == 1), BLOCK_R=64, num_warps=4
-    )
-
-    h = torch.empty((E, 3072), device=device, dtype=torch.float32)
-    _fused_situ_kernel[(triton.cdiv(E * 3072, 256),)](
-        g1, u3, h, N=E * 3072, BLOCK=256, num_warps=4
-    )
-    h_rot = torch.bmm(h.view(E, 48, 64), qb_T_stack.index_select(0, tiers_e))
-    dl_w2_1 = (h_rot.view(E, 768, 4) @ luts_T_f32[1]).contiguous()
-    dl_w2_2 = (h_rot.view(E, 768, 4) @ luts_T_f32[2]).contiguous()
-    dl_w2_3 = (h_rot.view(E, 384, 8) @ luts_T_f32[3]).contiguous()
+    z_blocks = zf.view(T, 56, 64)
+    dl1 = ((z_blocks @ qb_T_f32[1]).view(T, 896, 4) @ luts_T_f32[1]).contiguous()
+    dl2 = ((z_blocks @ qb_T_f32[2]).view(T, 896, 4) @ luts_T_f32[2]).contiguous()
+    dl3 = ((z_blocks @ qb_T_f32[3]).view(T, 448, 8) @ luts_T_f32[3]).contiguous()
 
     u = torch.zeros((T, 3584), device=device, dtype=torch.float32)
-    v2_tmp = torch.empty((E, 16), device=device, dtype=torch.float32)
-    _batched_svd_v_kernel[(16, E)](
-        h, ptrs, 11, 11, v2_tmp, v2_tmp, C=3072, SHARED_X=False, DUAL=False, BLOCK_C=512, num_warps=4
-    )
-    _batched_svd_u_w2_weighted_kernel[(56, E)](
-        v2_tmp, ptrs, flat_w, flat_t, u, R=3584, BLOCK_R=64, num_warps=4
-    )
-    _batched_sc_lut_w2_dotlut_splitk_kernel[(56, 24, E)](
-        ptrs, dl_w2_1, dl_w2_2, dl_w2_3, flat_w, flat_t, u, R=3584, BLOCK_R=64, num_warps=4
-    )
+    max_e_chunk = 128
+    for e0 in range(0, E, max_e_chunk):
+        e1 = min(e0 + max_e_chunk, E)
+        ec = e1 - e0
+        c_ptrs = ptrs[e0:e1]
+        c_w = flat_w[e0:e1]
+        c_t = flat_t[e0:e1]
+        z_in = zf if T == 1 else zf.index_select(0, c_t).contiguous()
+        tiers_e = c_ptrs[:, 12]
+
+        v1_tmp = torch.empty((ec, 16), device=device, dtype=torch.float32)
+        v3_tmp = torch.empty((ec, 16), device=device, dtype=torch.float32)
+        g1 = torch.empty((ec, 3072), device=device, dtype=torch.float32)
+        u3 = torch.empty((ec, 3072), device=device, dtype=torch.float32)
+        _batched_svd_v_kernel[(16, ec)](
+            z_in, c_ptrs, 3, 7, v1_tmp, v3_tmp, C=3584, SHARED_X=(T == 1), DUAL=True, BLOCK_C=512, num_warps=4
+        )
+        _batched_svd_u_kernel[(48, ec)](
+            v1_tmp, v3_tmp, c_ptrs, 2, 6, g1, u3, R=3072, DUAL=True, BLOCK_R=64, num_warps=4
+        )
+        _batched_sc_lut_w13_dotlut_splitk_kernel[(48, 28, ec)](
+            c_ptrs, dl1, dl2, dl3, c_t, g1, u3, R=3072, SHARED_X=(T == 1), BLOCK_R=64, num_warps=4
+        )
+
+        h = torch.empty((ec, 3072), device=device, dtype=torch.float32)
+        _fused_situ_kernel[(triton.cdiv(ec * 3072, 256),)](
+            g1, u3, h, N=ec * 3072, BLOCK=256, num_warps=4
+        )
+        h_rot = torch.bmm(h.view(ec, 48, 64), qb_T_stack.index_select(0, tiers_e))
+        dl_w2_1 = (h_rot.view(ec, 768, 4) @ luts_T_f32[1]).contiguous()
+        dl_w2_2 = (h_rot.view(ec, 768, 4) @ luts_T_f32[2]).contiguous()
+        dl_w2_3 = (h_rot.view(ec, 384, 8) @ luts_T_f32[3]).contiguous()
+
+        v2_tmp = torch.empty((ec, 16), device=device, dtype=torch.float32)
+        _batched_svd_v_kernel[(16, ec)](
+            h, c_ptrs, 11, 11, v2_tmp, v2_tmp, C=3072, SHARED_X=False, DUAL=False, BLOCK_C=512, num_warps=4
+        )
+        _batched_svd_u_w2_weighted_kernel[(56, ec)](
+            v2_tmp, c_ptrs, c_w, c_t, u, R=3584, BLOCK_R=64, num_warps=4
+        )
+        _batched_sc_lut_w2_dotlut_splitk_kernel[(56, 24, ec)](
+            c_ptrs, dl_w2_1, dl_w2_2, dl_w2_3, c_w, c_t, u, R=3584, BLOCK_R=64, num_warps=4
+        )
     return u
