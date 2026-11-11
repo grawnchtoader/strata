@@ -675,7 +675,7 @@ def load_strata_coder_multi_gpu(
     if promote_cold_to_ram is None:
         promote_cold_to_ram = True
     if eager_preload is None:
-        eager_preload = len(shard_paths) <= 8
+        eager_preload = True
 
     weight_sum = sum(layer_vram_weights.get(li, 1.0) for li in shard_paths) if layer_vram_weights else float(n_budget_layers)
     managers: Dict[int, TieredMoECacheManager] = {}
