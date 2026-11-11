@@ -101,12 +101,14 @@ class TieredMoECacheManager:
         force_arch_sm: int = 0,
         eager_preload: bool = True,
         vram_priority_override: Optional[List[int]] = None,
+        preload_ram: bool = True,
     ):
         self.shard_path = str(shard_path)
         self.layer_idx = layer_idx
         self.device = torch.device(device)
         self.force_arch_sm = force_arch_sm
         self.eager_preload = eager_preload
+        self.preload_ram = preload_ram
         self.out_dtype = resolve_optimal_dtype(self.device, out_dtype, force_arch_sm=force_arch_sm)
         self.vram_hot_budget_bytes = int(vram_hot_budget_gb * (1024 ** 3))
         self.vram_base_budget_bytes = self.vram_hot_budget_bytes
@@ -183,17 +185,7 @@ class TieredMoECacheManager:
             self._populate_tiers()
 
     def _pin_dict(self, entry: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        if self.device.type != "cuda" or not torch.cuda.is_available():
-            return entry
-        out: Dict[str, torch.Tensor] = {}
-        for k, v in entry.items():
-            if not v.is_cuda and not v.is_pinned():
-                try:
-                    v = v.pin_memory()
-                except Exception:
-                    pass
-            out[k] = v
-        return out
+        return entry
 
     def keys(self):
         return self._hdr.keys() if self._fd is not None else self._sf.keys()
@@ -302,11 +294,6 @@ class TieredMoECacheManager:
                     self.base_cache[k] = t.to(self.device, non_blocking=True)
                     self.vram_used_bytes += t_bytes
                 else:
-                    if self.device.type == "cuda" and torch.cuda.is_available() and not t.is_pinned():
-                        try:
-                            t = t.pin_memory()
-                        except Exception:
-                            pass
                     self.base_cache[k] = t
                     self.ram_used_bytes += t_bytes
             self._base_loaded = True
@@ -355,11 +342,6 @@ class TieredMoECacheManager:
             if t.dtype == torch.bfloat16 and self.out_dtype == torch.float16:
                 t = t.float().clamp(-65504.0, 65504.0).to(torch.float16)
             t_bytes = t.numel() * t.element_size()
-            if self.device.type == "cuda" and torch.cuda.is_available() and not t.is_pinned():
-                try:
-                    t = t.pin_memory()
-                except Exception:
-                    pass
             self.base_cache[key] = t
             self.ram_used_bytes += t_bytes
         if t.device == target_dev:
@@ -425,14 +407,19 @@ class TieredMoECacheManager:
         #   Bucket 3 (NVMe mmap): Any remaining tail experts stay on disk (0 B VRAM, 0 B RAM)
         for e in self.priority_order:
             tier = self.expert_tiers[e]
-            can_ram = tier < 3 or self.promote_cold_to_ram
+            can_ram = self.preload_ram and (tier < 3 or self.promote_cold_to_ram)
             if tier in tier_bytes:
                 tb = tier_bytes[tier]
                 vram_fits = (vram_used + tb) <= self.vram_hot_budget_bytes
                 ram_fits = can_ram and ((ram_used + tb) <= self.ram_warm_budget_bytes)
                 if not vram_fits and not ram_fits:
+                    if not self.preload_ram:
+                        break
                     continue
-            entry = self._read_expert_raw(e, torch.device("cpu"))
+            try:
+                entry = self._read_expert_raw(e, torch.device("cpu"))
+            except MemoryError:
+                break
             ebytes = sum(t.numel() * t.element_size() for t in entry.values())
             tier_bytes[tier] = ebytes
             if vram_used + ebytes <= self.vram_hot_budget_bytes:
@@ -440,9 +427,13 @@ class TieredMoECacheManager:
                 self.vram_cache[e] = gpu_e
                 self._vram_ptr_ready.add(e)
                 vram_used += ebytes
+                del entry
             elif can_ram and (ram_used + ebytes <= self.ram_warm_budget_bytes):
                 self.ram_cache[e] = self._pin_dict(entry)
                 ram_used += ebytes
+            elif not self.preload_ram:
+                del entry
+                break
         if self.vram_cache and self.device.type == "cuda":
             idxs = sorted(self.vram_cache.keys())
             rows = [self._make_ptr_row(e, self.vram_cache[e]) for e in idxs]
@@ -676,6 +667,7 @@ def load_strata_coder_multi_gpu(
         promote_cold_to_ram = True
     if eager_preload is None:
         eager_preload = True
+    preload_ram = len(shard_paths) <= 8 or os.environ.get("STRATA_PRELOAD_RAM") == "1"
 
     weight_sum = sum(layer_vram_weights.get(li, 1.0) for li in shard_paths) if layer_vram_weights else float(n_budget_layers)
     managers: Dict[int, TieredMoECacheManager] = {}
@@ -698,5 +690,6 @@ def load_strata_coder_multi_gpu(
             force_arch_sm=force_arch_sm,
             eager_preload=eager_preload,
             vram_priority_override=p_override,
+            preload_ram=preload_ram,
         )
     return managers
