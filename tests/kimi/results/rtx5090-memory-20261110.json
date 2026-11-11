@@ -1,0 +1,654 @@
+{
+  "scope": "Functional memory regression; not a speed or broad model-quality benchmark",
+  "baseline_revision": "f9efc05c054eccf6bba24e9efa66917e7bcfae80",
+  "model": "Grawnch/Kimi-K3.1-Pro-Coder",
+  "model_revision": "2d95f6402e05e930381fc343d5f926a15092df3b",
+  "layers": 93,
+  "tested_source_sha256": {
+    "tools/check_kimi_memory.py": "9bae9f01bb39431b8c3118e5cb271c8fe569568dc6012ea3b035981056d26595",
+    "python/strata_coder/decoder.py": "9a26f0a4b3b18b46e029745bdb345e0aa82d19995600f3f943cff8521b8aef6d",
+    "python/strata_coder/__init__.py": "991dd69954aafb38c7b8f35002beb36e7719373e625c08c44339720e2a21aa0a",
+    "python/strata_coder/serve.py": "566d67561249105950b319d310fe989e84f8cd837d2c9064a3fa25abc2eb4495",
+    "python/strata_coder/engine.py": "70b1c1bd0bf8f48c0afcd7df54e69070079ef4dec1dd76a7bd34459b418a1563",
+    "python/strata_coder/tiered_moe_loader.py": "bb58df790f7d371c675fb6fd1f3823f5e2d116df36a69361b000e84e6d65b8c6",
+    "python/strata_coder/kimi_tier_profile.json": "f82ab7b77a83cd58eb550ed230ff97a06d228b0cd7f2c3a2d8d248f6543a4d59"
+  },
+  "hardware": {
+    "cpu": "AMD EPYC 9654, 96 cores / 192 threads",
+    "ram_gib": 624,
+    "gpus": [
+      "NVIDIA GeForce RTX 5090",
+      "NVIDIA GeForce RTX 5090"
+    ],
+    "nvml_memory_mib_per_gpu": 32607,
+    "nvidia_driver": "595.91.07"
+  },
+  "runtime": {
+    "python": "3.12.14",
+    "torch": "2.12.0+cu132",
+    "triton": "3.7.0",
+    "transformers": "5.19.0",
+    "ram_gib_argument": 600,
+    "ram_budget_fraction": 0.8,
+    "vram_gib_argument": "auto",
+    "allocator": "expandable_segments:True",
+    "temperature": 0,
+    "reasoning_effort": "none"
+  },
+  "expected_baseline_failure": {
+    "input_tokens": 34,
+    "seconds": 40.18265796918422,
+    "error": "CUDA OOM allocating 1.59 GiB on GPU0",
+    "temporary_batch_owners": 1950,
+    "allocated_bytes": [
+      31497068032,
+      2300587520
+    ],
+    "peak_allocated_bytes": [
+      31823233024,
+      2300587520
+    ]
+  },
+  "cpu_regressions": {
+    "passed": 21,
+    "seconds": 2.72
+  },
+  "expert_oracle": {
+    "checks": 18,
+    "maximum_relative_l2": 1.4933828424545936e-05,
+    "results": [
+      {
+        "device": "cuda:0",
+        "layer": 1,
+        "tier": 1,
+        "expert": 11,
+        "tokens": 1,
+        "relative_l2": 1.1633303984126542e-05,
+        "max_abs_error": 3.073364496231079e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:0",
+        "layer": 1,
+        "tier": 1,
+        "expert": 11,
+        "tokens": 4,
+        "relative_l2": 1.1401720257708803e-05,
+        "max_abs_error": 3.501772880554199e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:0",
+        "layer": 1,
+        "tier": 1,
+        "expert": 11,
+        "tokens": 7,
+        "relative_l2": 1.1501537301228382e-05,
+        "max_abs_error": 3.427267074584961e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:0",
+        "layer": 1,
+        "tier": 2,
+        "expert": 4,
+        "tokens": 1,
+        "relative_l2": 1.2156133379903622e-05,
+        "max_abs_error": 3.0174851417541504e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:0",
+        "layer": 1,
+        "tier": 2,
+        "expert": 4,
+        "tokens": 4,
+        "relative_l2": 1.1644297956081573e-05,
+        "max_abs_error": 3.2421667128801346e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:0",
+        "layer": 1,
+        "tier": 2,
+        "expert": 4,
+        "tokens": 7,
+        "relative_l2": 1.1107866157544777e-05,
+        "max_abs_error": 3.2223761081695557e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:0",
+        "layer": 1,
+        "tier": 3,
+        "expert": 0,
+        "tokens": 1,
+        "relative_l2": 1.4933828424545936e-05,
+        "max_abs_error": 2.1595042198896408e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:0",
+        "layer": 1,
+        "tier": 3,
+        "expert": 0,
+        "tokens": 4,
+        "relative_l2": 1.4213665053830482e-05,
+        "max_abs_error": 2.5890767574310303e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:0",
+        "layer": 1,
+        "tier": 3,
+        "expert": 0,
+        "tokens": 7,
+        "relative_l2": 1.4294826542027295e-05,
+        "max_abs_error": 2.60770320892334e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:1",
+        "layer": 47,
+        "tier": 1,
+        "expert": 4,
+        "tokens": 1,
+        "relative_l2": 1.1696594810928218e-05,
+        "max_abs_error": 3.46451997756958e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:1",
+        "layer": 47,
+        "tier": 1,
+        "expert": 4,
+        "tokens": 4,
+        "relative_l2": 1.1909914064744953e-05,
+        "max_abs_error": 3.8550933822989464e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:1",
+        "layer": 47,
+        "tier": 1,
+        "expert": 4,
+        "tokens": 7,
+        "relative_l2": 1.2093085388187319e-05,
+        "max_abs_error": 3.8766302168369293e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:1",
+        "layer": 47,
+        "tier": 2,
+        "expert": 8,
+        "tokens": 1,
+        "relative_l2": 1.2289539881749079e-05,
+        "max_abs_error": 2.948800101876259e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:1",
+        "layer": 47,
+        "tier": 2,
+        "expert": 8,
+        "tokens": 4,
+        "relative_l2": 1.2346678886387963e-05,
+        "max_abs_error": 3.3155083656311035e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:1",
+        "layer": 47,
+        "tier": 2,
+        "expert": 8,
+        "tokens": 7,
+        "relative_l2": 1.2421104656823445e-05,
+        "max_abs_error": 3.5902485251426697e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:1",
+        "layer": 47,
+        "tier": 3,
+        "expert": 0,
+        "tokens": 1,
+        "relative_l2": 1.3934546586824581e-05,
+        "max_abs_error": 2.2142194211483002e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:1",
+        "layer": 47,
+        "tier": 3,
+        "expert": 0,
+        "tokens": 4,
+        "relative_l2": 1.4315722182800528e-05,
+        "max_abs_error": 2.637971192598343e-07,
+        "finite": true
+      },
+      {
+        "device": "cuda:1",
+        "layer": 47,
+        "tier": 3,
+        "expert": 0,
+        "tokens": 7,
+        "relative_l2": 1.4837677554169204e-05,
+        "max_abs_error": 2.6775524020195007e-07,
+        "finite": true
+      }
+    ]
+  },
+  "full_model_http": {
+    "passed_generations": 7,
+    "forwards": 29,
+    "expected_injected_errors": 3,
+    "all_completed_logits_finite": true,
+    "all_post_forward_transients_zero": true,
+    "peak_allocated_bytes": [
+      29297070080,
+      29306614272
+    ],
+    "code_execution_cases_passed": 5,
+    "concurrent_http_clients": 2,
+    "native_parallel_batch_claimed": false,
+    "cases": [
+      {
+        "case": "arithmetic",
+        "prompt": "What is 2+2? Reply with only the number.",
+        "response": "4",
+        "seconds": 317.7808500472456,
+        "pass": true,
+        "post_response_memory": {
+          "transients": {
+            "expert_stages": 0,
+            "base_stages": 0,
+            "batch_owners": 0
+          },
+          "accounted_vram": {
+            "cuda:0": 22763191808,
+            "cuda:1": 27433263104
+          },
+          "allocated": [
+            27520372736,
+            27500378624
+          ],
+          "reserved": [
+            29435625472,
+            29391585280
+          ],
+          "peak_allocated": [
+            28831264768,
+            28758457344
+          ]
+        }
+      },
+      {
+        "case": "russian",
+        "prompt": "Как называется столица Франции? Ответь одним словом.",
+        "response": "Париж",
+        "seconds": 119.87874870188534,
+        "pass": true,
+        "post_response_memory": {
+          "transients": {
+            "expert_stages": 0,
+            "base_stages": 0,
+            "batch_owners": 0
+          },
+          "accounted_vram": {
+            "cuda:0": 22763191808,
+            "cuda:1": 27459313664
+          },
+          "allocated": [
+            27520372736,
+            27526429184
+          ],
+          "reserved": [
+            29452402688,
+            29555163136
+          ],
+          "peak_allocated": [
+            28906839552,
+            28924730368
+          ]
+        }
+      },
+      {
+        "case": "arithmetic-repeat",
+        "prompt": "What is 2+2? Reply with only the number.",
+        "response": "4",
+        "seconds": 26.15223789261654,
+        "pass": true,
+        "post_response_memory": {
+          "transients": {
+            "expert_stages": 0,
+            "base_stages": 0,
+            "batch_owners": 0
+          },
+          "accounted_vram": {
+            "cuda:0": 22763191808,
+            "cuda:1": 27459313664
+          },
+          "allocated": [
+            27520372736,
+            27526429184
+          ],
+          "reserved": [
+            29460791296,
+            29569843200
+          ],
+          "peak_allocated": [
+            28906839552,
+            28924730368
+          ]
+        }
+      },
+      {
+        "case": "python-add",
+        "prompt": "Write a Python function add(a, b) that returns their sum. No annotations. Output only the code.",
+        "response": "def add(a, b):\n    return a + b",
+        "seconds": 189.19117443775758,
+        "pass": true,
+        "post_response_memory": {
+          "transients": {
+            "expert_stages": 0,
+            "base_stages": 0,
+            "batch_owners": 0
+          },
+          "accounted_vram": {
+            "cuda:0": 22763191808,
+            "cuda:1": 27459313664
+          },
+          "allocated": [
+            27520372736,
+            27526429184
+          ],
+          "reserved": [
+            29485957120,
+            29611786240
+          ],
+          "peak_allocated": [
+            28917885440,
+            28970892288
+          ]
+        }
+      },
+      {
+        "case": "recovery",
+        "prompt": "What is 2+2? Reply with only the number.",
+        "response": "4",
+        "seconds": 22.14839629177004,
+        "pass": true,
+        "post_response_memory": {
+          "transients": {
+            "expert_stages": 0,
+            "base_stages": 0,
+            "batch_owners": 0
+          },
+          "accounted_vram": {
+            "cuda:0": 22763191808,
+            "cuda:1": 27459313664
+          },
+          "allocated": [
+            27520372736,
+            27526429184
+          ],
+          "reserved": [
+            29485957120,
+            29611786240
+          ],
+          "peak_allocated": [
+            28917885440,
+            28970892288
+          ]
+        }
+      },
+      {
+        "case": "client-0",
+        "prompt": "Reply with only the digit 7.",
+        "response": "7",
+        "seconds": 64.31764298770577,
+        "pass": true,
+        "post_response_memory": {
+          "transients": {
+            "expert_stages": 0,
+            "base_stages": 0,
+            "batch_owners": 0
+          },
+          "accounted_vram": {
+            "cuda:0": 22763191808,
+            "cuda:1": 27459313664
+          },
+          "allocated": [
+            27920743424,
+            27961753600
+          ],
+          "reserved": [
+            29863444480,
+            29968302080
+          ],
+          "peak_allocated": [
+            29297070080,
+            29306614272
+          ]
+        }
+      },
+      {
+        "case": "client-1",
+        "prompt": "Reply with only the digit 8.",
+        "response": "8",
+        "seconds": 69.23057836992666,
+        "pass": true,
+        "post_response_memory": {
+          "transients": {
+            "expert_stages": 0,
+            "base_stages": 0,
+            "batch_owners": 0
+          },
+          "accounted_vram": {
+            "cuda:0": 22763191808,
+            "cuda:1": 27459313664
+          },
+          "allocated": [
+            27553927168,
+            27559983616
+          ],
+          "reserved": [
+            29863444480,
+            29968302080
+          ],
+          "peak_allocated": [
+            29297070080,
+            29306614272
+          ]
+        }
+      }
+    ]
+  },
+  "fault_recovery_with_gc_disabled": [
+    {
+      "cyclic_gc_enabled": false,
+      "extra_allocation_probe_mib": 128,
+      "unaccounted_allocated_growth_bytes": [
+        0,
+        0
+      ],
+      "transients": {
+        "expert_stages": 0,
+        "base_stages": 0,
+        "batch_owners": 0
+      }
+    },
+    {
+      "cyclic_gc_enabled": false,
+      "extra_allocation_probe_mib": 128,
+      "unaccounted_allocated_growth_bytes": [
+        0,
+        0
+      ],
+      "transients": {
+        "expert_stages": 0,
+        "base_stages": 0,
+        "batch_owners": 0
+      }
+    },
+    {
+      "cyclic_gc_enabled": false,
+      "extra_allocation_probe_mib": 128,
+      "unaccounted_allocated_growth_bytes": [
+        0,
+        0
+      ],
+      "transients": {
+        "expert_stages": 0,
+        "base_stages": 0,
+        "batch_owners": 0
+      }
+    }
+  ],
+  "standalone_cli": {
+    "exit_code": 0,
+    "command": "python tools/check_kimi_memory.py --model /path/to/Kimi-K3.1-Pro-Coder --ram-gb 600",
+    "expert_checks": 18,
+    "sequential_answers": [
+      {
+        "prompt": "What is 2+2? Reply with only the number.",
+        "answer": "4",
+        "transients": {
+          "expert_stages": 0,
+          "base_stages": 0,
+          "batch_owners": 0
+        },
+        "allocated": [
+          27486818304,
+          27466824192
+        ]
+      },
+      {
+        "prompt": "Как называется столица Франции? Ответь одним словом.",
+        "answer": "Париж",
+        "transients": {
+          "expert_stages": 0,
+          "base_stages": 0,
+          "batch_owners": 0
+        },
+        "allocated": [
+          27486818304,
+          27492874752
+        ]
+      },
+      {
+        "prompt": "What is 2+2? Reply with only the number.",
+        "answer": "4",
+        "transients": {
+          "expert_stages": 0,
+          "base_stages": 0,
+          "batch_owners": 0
+        },
+        "allocated": [
+          27486818304,
+          27492874752
+        ]
+      }
+    ]
+  },
+  "limits": [
+    "Short prompts and bounded outputs only; 4K+ contexts and GSM100 not evaluated",
+    "Representative expert oracle, not complete original-model logit parity",
+    "Existing automatic BF16-to-FP8 base-cache policy retained; checkpoint not converted",
+    "Only the Python Strata-Coder runtime is changed"
+  ],
+  "plain_http_four_clients": {
+    "passed": true,
+    "server": "unmodified strata_coder.serve",
+    "concurrent_http_clients": 4,
+    "native_parallel_batch_claimed": false,
+    "start_spread_s": 0.0014190319925546646,
+    "results": [
+      {
+        "client": 0,
+        "expected": "7",
+        "response": "7",
+        "pass": true,
+        "start_offset_s": 0.0030664578080177307,
+        "elapsed_s": 363.7691939272918,
+        "request": {
+          "model": "kimi-k3.1-pro-coder",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Reply with only the digit 7."
+            }
+          ],
+          "max_tokens": 4,
+          "temperature": 0,
+          "stream": false,
+          "reasoning_effort": "none"
+        }
+      },
+      {
+        "client": 1,
+        "expected": "8",
+        "response": "8",
+        "pass": true,
+        "start_offset_s": 0.0035069528967142105,
+        "elapsed_s": 370.47291769087315,
+        "request": {
+          "model": "kimi-k3.1-pro-coder",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Reply with only the digit 8."
+            }
+          ],
+          "max_tokens": 4,
+          "temperature": 0,
+          "stream": false,
+          "reasoning_effort": "none"
+        }
+      },
+      {
+        "client": 2,
+        "expected": "9",
+        "response": "9",
+        "pass": true,
+        "start_offset_s": 0.0038844728842377663,
+        "elapsed_s": 360.2917043589987,
+        "request": {
+          "model": "kimi-k3.1-pro-coder",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Reply with only the digit 9."
+            }
+          ],
+          "max_tokens": 4,
+          "temperature": 0,
+          "stream": false,
+          "reasoning_effort": "none"
+        }
+      },
+      {
+        "client": 3,
+        "expected": "6",
+        "response": "6",
+        "pass": true,
+        "start_offset_s": 0.0024654408916831017,
+        "elapsed_s": 366.98068927414715,
+        "request": {
+          "model": "kimi-k3.1-pro-coder",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Reply with only the digit 6."
+            }
+          ],
+          "max_tokens": 4,
+          "temperature": 0,
+          "stream": false,
+          "reasoning_effort": "none"
+        }
+      }
+    ]
+  }
+}

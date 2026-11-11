@@ -893,11 +893,15 @@ def sc_lut_batched_experts_mlp(
     _batched_sc_lut_w13_dotlut_splitk_kernel[(48, 28, E)](
         ptrs, dl1, dl2, dl3, g1, u3, R=3072, SHARED_X=(T == 1), BLOCK_R=64, num_warps=4
     )
+    # The first projection's tables are no longer needed when constructing
+    # the similarly large second projection tables.
+    del dl1, dl2, dl3, v1_tmp, v3_tmp
 
     h = torch.empty((E, 3072), device=device, dtype=torch.float32)
     _fused_situ_kernel[(triton.cdiv(E * 3072, 256),)](
         g1, u3, h, N=E * 3072, BLOCK=256, num_warps=4
     )
+    del g1, u3
     h_rot = torch.bmm(h.view(E, 48, 64), qb_T_stack.index_select(0, tiers_e))
     dl_w2_1 = (h_rot.view(E, 768, 4) @ luts_T_f32[1]).contiguous()
     dl_w2_2 = (h_rot.view(E, 768, 4) @ luts_T_f32[2]).contiguous()

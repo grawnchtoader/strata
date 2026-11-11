@@ -1,9 +1,12 @@
 import os
 import json
+import logging
 import shutil
 import socket
 import struct
+import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Tuple
 import torch
@@ -26,6 +29,29 @@ from .tiered_moe_loader import (
     detect_system_memory_gb,
     load_strata_coder_multi_gpu,
 )
+
+
+def _run_cleanup(actions, primary=None):
+    """Try every cleanup; preserve an exception already in flight."""
+    first_error = None
+    try:
+        for action in actions:
+            try:
+                action()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                if primary is not None:
+                    logging.getLogger(__name__).error(
+                        "Cleanup failed while handling another exception: %s: %s",
+                        type(exc).__name__, str(exc),
+                    )
+        if first_error is not None and primary is None:
+            raise first_error
+    finally:
+        # An exception's traceback points back to this frame. Avoid retaining
+        # tensors until cyclic GC runs after a failed forward or cleanup.
+        first_error = primary = None
 
 if _HAS_TRITON:
     import triton
@@ -332,7 +358,7 @@ def gpu_dense(sf, li: int, nrm: torch.Tensor, device: torch.device) -> torch.Ten
     return _mm(gpu_situ(g, u), _fetch_weight(sf, None, f"{p}.down_proj.weight", device))
 
 
-def gpu_moe_forward(
+def _gpu_moe_forward_chunk(
     sf,
     li: int,
     nrm: torch.Tensor,
@@ -374,20 +400,30 @@ def gpu_moe_forward(
     flat_e = topk_idx.view(-1)
 
     if cache_mgr is not None and _HAS_TRITON and nrm.is_cuda:
-        ptrs = cache_mgr.get_experts_batch_ptrs_gpu(flat_e)
-        if T == 1:
-            flat_t_i64 = torch.zeros(K, device=device, dtype=torch.int64)
-        else:
-            flat_t_i64 = torch.arange(T, device=device, dtype=torch.int64).unsqueeze(1).expand(T, K).reshape(-1)
-        u = sc_lut_batched_experts_mlp(
-            z=z,
-            ptrs=ptrs,
-            flat_w=topk_w.view(-1).contiguous(),
-            flat_t=flat_t_i64,
-            luts_T_f32=cache_mgr.luts_T_f32,
-            qb_T_f32=cache_mgr.qb_T_f32,
-            qb_T_stack=cache_mgr.qb_T_stack,
-        )
+        error = None
+        try:
+            ptrs = cache_mgr.get_experts_batch_ptrs_gpu(flat_e)
+            if T == 1:
+                flat_t_i64 = torch.zeros(K, device=device, dtype=torch.int64)
+            else:
+                flat_t_i64 = torch.arange(T, device=device, dtype=torch.int64).unsqueeze(1).expand(T, K).reshape(-1)
+            u = sc_lut_batched_experts_mlp(
+                z=z,
+                ptrs=ptrs,
+                flat_w=topk_w.view(-1).contiguous(),
+                flat_t=flat_t_i64,
+                luts_T_f32=cache_mgr.luts_T_f32,
+                qb_T_f32=cache_mgr.qb_T_f32,
+                qb_T_stack=cache_mgr.qb_T_stack,
+            )
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            try:
+                _run_cleanup([cache_mgr.release_experts_batch], error)
+            finally:
+                error = None
         y = _mm(gpu_rmsnorm(u, lat_nw, 1e-5), lat_up)
         return y + sh_out
 
@@ -446,6 +482,24 @@ def gpu_moe_forward(
     return y + sh_out
 
 
+def gpu_moe_forward(
+    sf, li, nrm, device, cache_mgr=None, next_cache_mgr=None,
+    force_arch_sm=0, next2_cache_mgr=None, res_base=None,
+):
+    # DotLUT workspace scales with tokens * 16 routed experts. Keep its
+    # peak bounded while preserving token order and independent routing.
+    chunk_tokens = 4
+    outputs = []
+    for start in range(0, nrm.shape[0], chunk_tokens):
+        stop = min(start + chunk_tokens, nrm.shape[0])
+        outputs.append(_gpu_moe_forward_chunk(
+            sf, li, nrm[start:stop], device, cache_mgr, next_cache_mgr,
+            force_arch_sm, next2_cache_mgr,
+            res_base[start:stop] if res_base is not None else None,
+        ))
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
+
 class KimiCoderEngine:
     """
     End-to-End 93-Layer Inference Engine for Grawnch/Kimi-K3.1-Pro-Coder.
@@ -469,6 +523,7 @@ class KimiCoderEngine:
         peer_addr: Optional[str] = None,
     ):
         self.model_id_or_dir = model_id_or_dir
+        self._forward_lock = threading.RLock()
         self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
         if cache_dir is None:
             cache_dir = "/dev/shm/kimi_cache" if Path("/dev/shm").exists() else str(Path.home() / ".cache" / "strata_kimi")
@@ -663,6 +718,23 @@ class KimiCoderEngine:
         bres: List[torch.Tensor],
         layer_out_cache: Optional[Dict] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        try:
+            return self._run_layer_range_impl(cur, bres, layer_out_cache)
+        except BaseException as exc:
+            # Future layers can already have speculative copies. A failed
+            # forward must not leave them or partial attention state behind.
+            _run_cleanup((mgr.release_transient_gpu_buffers for mgr in self.layer_managers.values()), exc)
+            if layer_out_cache is not None:
+                layer_out_cache.clear()
+            raise
+
+    @torch.no_grad()
+    def _run_layer_range_impl(
+        self,
+        cur: torch.Tensor,
+        bres: List[torch.Tensor],
+        layer_out_cache: Optional[Dict] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         num_local = max(self.end_layer - max(1, self.start_layer), 1)
         for li in range(self.start_layer, self.end_layer):
             shard_idx = li + 1
@@ -699,45 +771,61 @@ class KimiCoderEngine:
                 else:
                     sf_ctx = safe_open(spath, framework="pt", device="cpu")
                     sf = sf_ctx.__enter__()
-            try:
-                lp = f"language_model.model.layers.{li}"
-                if bres:
-                    rn_a = _fetch_weight(sf, mgr, f"{lp}.self_attention_res_norm.weight", layer_dev)
-                    rp_a = _fetch_weight(sf, mgr, f"{lp}.self_attention_res_proj.weight", layer_dev).squeeze()
-                    h_in = gpu_res_mix(cur, bres, rn_a, rp_a)
-                else:
-                    h_in = cur
-                if li % 12 == 0:
-                    bres.append(cur)
-                    have_prefix = False
-                else:
-                    have_prefix = True
-                nrm_a = gpu_rmsnorm(h_in, _fetch_weight(sf, mgr, f"{lp}.input_layernorm.weight", layer_dev))
-                l_state = layer_out_cache.setdefault(li, {}) if layer_out_cache is not None else None
-                if li in FULL_ATTN_LAYERS:
-                    ao = gpu_mla_forward(sf, li, nrm_a, layer_dev, mgr, layer_state=l_state)
-                else:
-                    ao = gpu_kda_forward(sf, li, nrm_a, layer_dev, mgr, layer_state=l_state)
-                cur = (cur + ao) if have_prefix else ao
+            with torch.cuda.device(layer_dev) if layer_dev.type == "cuda" else nullcontext():
+                error = None
+                try:
+                    lp = f"language_model.model.layers.{li}"
+                    if bres:
+                        rn_a = _fetch_weight(sf, mgr, f"{lp}.self_attention_res_norm.weight", layer_dev)
+                        rp_a = _fetch_weight(sf, mgr, f"{lp}.self_attention_res_proj.weight", layer_dev).squeeze()
+                        h_in = gpu_res_mix(cur, bres, rn_a, rp_a)
+                    else:
+                        h_in = cur
+                    if li % 12 == 0:
+                        bres.append(cur)
+                        have_prefix = False
+                    else:
+                        have_prefix = True
+                    nrm_a = gpu_rmsnorm(h_in, _fetch_weight(sf, mgr, f"{lp}.input_layernorm.weight", layer_dev))
+                    l_state = layer_out_cache.setdefault(li, {}) if layer_out_cache is not None else None
+                    if li in FULL_ATTN_LAYERS:
+                        ao = gpu_mla_forward(sf, li, nrm_a, layer_dev, mgr, layer_state=l_state)
+                    else:
+                        ao = gpu_kda_forward(sf, li, nrm_a, layer_dev, mgr, layer_state=l_state)
+                    cur = (cur + ao) if have_prefix else ao
 
-                rn_m = _fetch_weight(sf, mgr, f"{lp}.mlp_res_norm.weight", layer_dev)
-                rp_m = _fetch_weight(sf, mgr, f"{lp}.mlp_res_proj.weight", layer_dev).squeeze()
-                h_mlp = gpu_res_mix(cur, bres, rn_m, rp_m)
-                nrm_m = gpu_rmsnorm(h_mlp, _fetch_weight(sf, mgr, f"{lp}.post_attention_layernorm.weight", layer_dev))
-                if li == 0:
-                    mo = gpu_dense(sf, li, nrm_m, layer_dev)
-                    cur = cur + mo
-                elif li == self.max_layers - 1 and cur.shape[0] > 1:
-                    mo_last = gpu_moe_forward(sf, li, nrm_m[-1:], layer_dev, mgr, next_mgr, self.force_arch_sm, next2_mgr, cur[-1:])
-                    cur = torch.cat([cur[:-1], cur[-1:] + mo_last], dim=0)
-                else:
-                    mo = gpu_moe_forward(sf, li, nrm_m, layer_dev, mgr, next_mgr, self.force_arch_sm, next2_mgr, cur)
-                    cur = cur + mo
-            finally:
-                if sf_ctx is not None:
-                    sf_ctx.__exit__(None, None, None)
-                if tmp_dir is not None:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    rn_m = _fetch_weight(sf, mgr, f"{lp}.mlp_res_norm.weight", layer_dev)
+                    rp_m = _fetch_weight(sf, mgr, f"{lp}.mlp_res_proj.weight", layer_dev).squeeze()
+                    h_mlp = gpu_res_mix(cur, bres, rn_m, rp_m)
+                    nrm_m = gpu_rmsnorm(h_mlp, _fetch_weight(sf, mgr, f"{lp}.post_attention_layernorm.weight", layer_dev))
+                    if li == 0:
+                        mo = gpu_dense(sf, li, nrm_m, layer_dev)
+                        cur = cur + mo
+                    elif li == self.max_layers - 1 and cur.shape[0] > 1:
+                        mo_last = gpu_moe_forward(sf, li, nrm_m[-1:], layer_dev, mgr, next_mgr, self.force_arch_sm, next2_mgr, cur[-1:])
+                        cur = torch.cat([cur[:-1], cur[-1:] + mo_last], dim=0)
+                    else:
+                        mo = gpu_moe_forward(sf, li, nrm_m, layer_dev, mgr, next_mgr, self.force_arch_sm, next2_mgr, cur)
+                        cur = cur + mo
+                    # Do not retain one layer's intermediates across the next
+                    # layer's allocation peak (especially across devices).
+                    rn_a = rp_a = h_in = nrm_a = ao = None
+                    rn_m = rp_m = h_mlp = nrm_m = mo = mo_last = None
+                except BaseException as exc:
+                    error = exc
+                    raise
+                finally:
+                    actions = []
+                    if mgr is not None:
+                        actions.append(mgr.release_transient_gpu_buffers)
+                    if sf_ctx is not None:
+                        actions.append(lambda: sf_ctx.__exit__(None, None, None))
+                    if tmp_dir is not None:
+                        actions.append(lambda: shutil.rmtree(tmp_dir, ignore_errors=True))
+                    try:
+                        _run_cleanup(actions, error)
+                    finally:
+                        error = None
         return cur, bres
 
     @torch.no_grad()
@@ -754,6 +842,33 @@ class KimiCoderEngine:
 
     @torch.no_grad()
     def forward_last_logits(
+        self,
+        input_ids: List[int],
+        layer_out_cache: Optional[Dict] = None,
+    ) -> torch.Tensor:
+        # The managers' pointer tables and transient staging buffers are shared
+        # by HTTP requests; their lifetimes must not overlap between forwards.
+        with self._forward_lock:
+            error = None
+            try:
+                return self._forward_last_logits_impl(input_ids, layer_out_cache)
+            except BaseException as exc:
+                error = exc
+                if layer_out_cache is not None:
+                    layer_out_cache.clear()
+                raise
+            finally:
+                try:
+                    _run_cleanup((mgr.release_transient_gpu_buffers for mgr in self.layer_managers.values()), error)
+                except BaseException:
+                    if layer_out_cache is not None:
+                        layer_out_cache.clear()
+                    raise
+                finally:
+                    error = None
+
+    @torch.no_grad()
+    def _forward_last_logits_impl(
         self,
         input_ids: List[int],
         layer_out_cache: Optional[Dict] = None,

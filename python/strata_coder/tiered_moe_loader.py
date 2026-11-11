@@ -159,10 +159,19 @@ class TieredMoECacheManager:
         self.ram_cache: Dict[int, Dict[str, torch.Tensor]] = {}
         self.base_cache: Dict[str, torch.Tensor] = {}
         self.prefetch_buffer: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_pending = set()
+        self._prefetch_epoch = 0
         self.expert_ptr_table = torch.zeros((len(self.expert_tiers), 14), dtype=torch.int64, device=self.device)
         self._vram_ptr_ready = set()
         self._last_batch_keepalive: List[Dict[str, torch.Tensor]] = []
         self._gpu_stage_cache: Dict[int, Tuple[Dict[str, torch.Tensor], Optional[torch.cuda.Event]]] = {}
+        self._base_gpu_stage: Dict[str, Tuple[torch.Tensor, Optional[torch.cuda.Event]]] = {}
+        # Lookup tables and pointer metadata also consume the layer's resident budget.
+        self.vram_used_bytes += self._gpu_tensor_bytes([
+            *self.luts.values(), *self.q_bases.values(), *self.luts_T_f32.values(),
+            *self.qb_T_f32.values(), self.qb_T_stack, self.expert_ptr_table,
+        ])
         self._transfer_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=self.device)
             if (self.device.type == "cuda" and torch.cuda.is_available())
@@ -181,6 +190,60 @@ class TieredMoECacheManager:
             if not self.priority_order:
                 self.priority_order = self._compute_expert_priority_order()
             self._populate_tiers()
+
+    @staticmethod
+    def _gpu_tensor_bytes(tensors) -> int:
+        return sum(t.numel() * t.element_size() for t in tensors if t.is_cuda)
+
+    def _available_staging_bytes(self) -> int:
+        staged_bytes = sum(
+            self._gpu_tensor_bytes(raw.values()) for raw, _ in self._gpu_stage_cache.values()
+        ) + self._gpu_tensor_bytes(t for t, _ in self._base_gpu_stage.values())
+        return max(0, self.vram_hot_budget_bytes - self.vram_used_bytes - staged_bytes)
+
+    def release_experts_batch(self):
+        """Release pointer-only batch owners after its kernels have been enqueued."""
+        if self._last_batch_keepalive and self.device.type == "cuda":
+            with torch.cuda.device(self.device):
+                stream = torch.cuda.current_stream(self.device)
+                for raw in self._last_batch_keepalive:
+                    for tensor in raw.values():
+                        if tensor.is_cuda:
+                            tensor.record_stream(stream)
+        self._last_batch_keepalive.clear()
+
+    def release_transient_gpu_buffers(self):
+        """End this layer's visit, including unused speculative transfers.
+
+        Unconsumed staged tensors were allocated on the transfer stream, whose
+        allocator lifetime already covers their pending copies. Consumed tensors
+        are recorded on the compute stream by their getter or batch release.
+        """
+        self.release_experts_batch()
+        self._gpu_stage_cache.clear()
+        self._base_gpu_stage.clear()
+        with self._prefetch_lock:
+            self._prefetch_epoch += 1
+            self.prefetch_buffer.clear()
+        if self._base_fut is not None:
+            # A worker may still allocate resident base tensors. Fence it before
+            # reporting this layer's post-visit memory or reusing its accounting.
+            error = self._base_fut.exception()
+            if error is None:
+                self._base_fut = None
+            else:
+                # Keep the error for the next consumer, without retaining a failed
+                # loader frame's GPU conversion temporaries through its traceback.
+                pending, seen = [error], set()
+                while pending:
+                    chained = pending.pop()
+                    if id(chained) in seen:
+                        continue
+                    seen.add(id(chained))
+                    chained.__traceback__ = None
+                    pending.extend(
+                        cause for cause in (chained.__cause__, chained.__context__) if cause is not None
+                    )
 
     def _pin_dict(self, entry: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if self.device.type != "cuda" or not torch.cuda.is_available():
@@ -256,6 +319,17 @@ class TieredMoECacheManager:
         return res
 
     def ensure_base_weights_loaded(self):
+        if self._base_fut is not None:
+            future, self._base_fut = self._base_fut, None
+            try:
+                future.result()
+            finally:
+                # A failed Future owns its exception. Do not close a cycle
+                # through this frame when result() adds it to the traceback.
+                future = None
+        self._load_base_weights()
+
+    def _load_base_weights(self):
         if self._base_loaded:
             return
         with self._base_lock:
@@ -312,30 +386,35 @@ class TieredMoECacheManager:
             self._base_loaded = True
 
     def prefetch_base_weights_async(self):
+        if self._base_fut is not None and self._base_fut.done():
+            future, self._base_fut = self._base_fut, None
+            try:
+                future.result()
+            finally:
+                future = None
         if not self._base_loaded and self._base_fut is None:
-            self._base_fut = self._pool.submit(self.ensure_base_weights_loaded)
+            self._base_fut = self._pool.submit(self._load_base_weights)
         elif self._base_loaded and self._transfer_stream is not None:
             self.stage_base_weights_to_gpu_async()
 
     @torch.no_grad()
     def stage_base_weights_to_gpu_async(self):
-        """Asynchronously DMA-copies any CPU-resident base_cache tensors to GPU on _transfer_stream."""
+        """Prefetch CPU base tensors only within the layer's remaining budget."""
         if self._transfer_stream is None or not self._base_loaded:
             return
-        if not hasattr(self, "_base_gpu_stage"):
-            self._base_gpu_stage: Dict[str, Tuple[torch.Tensor, Optional[torch.cuda.Event]]] = {}
-        cpu_items = [
-            (k, v) for k, v in self.base_cache.items()
-            if not isinstance(v, tuple) and not v.is_cuda and k not in self._base_gpu_stage
-        ]
-        if not cpu_items:
-            return
-        with torch.cuda.stream(self._transfer_stream):
-            ev = torch.cuda.Event()
-            staged = {k: v.to(self.device, non_blocking=True) for k, v in cpu_items}
-            ev.record(self._transfer_stream)
-        for k, gt in staged.items():
-            self._base_gpu_stage[k] = (gt, ev)
+        available = self._available_staging_bytes()
+        with torch.cuda.device(self.device), torch.cuda.stream(self._transfer_stream):
+            for k, v in self.base_cache.items():
+                if isinstance(v, tuple) or v.is_cuda or k in self._base_gpu_stage:
+                    continue
+                nbytes = v.numel() * v.element_size()
+                if nbytes > available:
+                    continue
+                gt = v.to(self.device, non_blocking=True)
+                ev = torch.cuda.Event()
+                ev.record(self._transfer_stream)
+                self._base_gpu_stage[k] = (gt, ev)
+                available -= nbytes
 
     def get_base_tensor(self, key: str, target_dev: torch.device):
         if not self._base_loaded:
@@ -454,9 +533,21 @@ class TieredMoECacheManager:
 
     def register_folded_lookahead(self, lead: int, w_prime: torch.Tensor, bias: Optional[torch.Tensor] = None):
         """Registers precomputed lookahead projection weights for lead d in {1, 2}."""
-        self.lookahead_w[lead] = w_prime.to(device=self.device, dtype=torch.float32)
+        old = [cache[lead] for cache in (self.lookahead_w, self.lookahead_bias) if lead in cache]
+        old_bytes = self._gpu_tensor_bytes(old)
+        new_bytes = (w_prime.numel() + (bias.numel() if bias is not None else 0)) * 4
+        if self.device.type == "cuda" and self.vram_used_bytes - old_bytes + new_bytes > self.vram_hot_budget_bytes:
+            # Lookahead is optional; eager resident weights may already fill the budget.
+            return
+        w = w_prime.to(device=self.device, dtype=torch.float32)
+        b = bias.to(device=self.device, dtype=torch.float32) if bias is not None else None
+        self.vram_used_bytes -= old_bytes
+        self.lookahead_w[lead] = w
         if bias is not None:
-            self.lookahead_bias[lead] = bias.to(device=self.device, dtype=torch.float32)
+            self.lookahead_bias[lead] = b
+        else:
+            self.lookahead_bias.pop(lead, None)
+        self.vram_used_bytes += self._gpu_tensor_bytes([w] + ([b] if b is not None else []))
 
     @torch.no_grad()
     def predict_and_prefetch_lookahead(
@@ -483,12 +574,32 @@ class TieredMoECacheManager:
 
     def prefetch_cold_experts_async(self, predicted_experts: List[int]):
         """RouterLookahead hook: asynchronously prefetches predicted Cold NVMe experts."""
-        for e in predicted_experts:
-            if e not in self.vram_cache and e not in self.ram_cache and e not in self.prefetch_buffer:
-                self._pool.submit(self._prefetch_worker, e)
+        with self._prefetch_lock:
+            for e in dict.fromkeys(predicted_experts):
+                if len(self._prefetch_pending) + len(self.prefetch_buffer) >= 8:
+                    break
+                if e not in self.vram_cache and e not in self.ram_cache and e not in self.prefetch_buffer and e not in self._prefetch_pending:
+                    self._prefetch_pending.add(e)
+                    try:
+                        self._pool.submit(self._prefetch_worker, e, self._prefetch_epoch)
+                    except Exception:
+                        self._prefetch_pending.discard(e)
+                        raise
 
-    def _prefetch_worker(self, e: int):
-        self.prefetch_buffer[e] = self._read_expert_raw(e, torch.device("cpu"))
+    def _prefetch_worker(self, e: int, epoch: int):
+        try:
+            raw = self._read_expert_raw(e, torch.device("cpu"))
+            nbytes = sum(t.numel() * t.element_size() for t in raw.values())
+            with self._prefetch_lock:
+                buffered = sum(
+                    t.numel() * t.element_size()
+                    for entry in list(self.prefetch_buffer.values()) for t in entry.values()
+                )
+                if epoch == self._prefetch_epoch and self.ram_used_bytes + buffered + nbytes <= self.ram_warm_budget_bytes:
+                    self.prefetch_buffer[e] = raw
+        finally:
+            with self._prefetch_lock:
+                self._prefetch_pending.discard(e)
 
     def warm_experts_parallel(self, expert_ids: List[int]):
         missing = [
@@ -521,7 +632,7 @@ class TieredMoECacheManager:
         Ensures all routed experts in `flat_e` are staged in GPU memory and returns
         their [E, 14] int64 pointer table on GPU. Zero CPU round-trip when all experts are in VRAM.
         """
-        self._last_batch_keepalive.clear()
+        self.release_experts_batch()
         if len(self._vram_ptr_ready) == len(self.expert_tiers):
             return self.expert_ptr_table.index_select(0, flat_e).contiguous()
         e_list = flat_e.tolist()
@@ -551,7 +662,10 @@ class TieredMoECacheManager:
         cpu_raw = self.ram_cache.get(e)
         if cpu_raw is None:
             return
-        with torch.cuda.stream(self._transfer_stream):
+        nbytes = sum(t.numel() * t.element_size() for t in cpu_raw.values())
+        if nbytes > self._available_staging_bytes():
+            return
+        with torch.cuda.device(self.device), torch.cuda.stream(self._transfer_stream):
             gpu_raw = {k: v.to(self.device, non_blocking=True) for k, v in cpu_raw.items()}
             ev = torch.cuda.Event()
             ev.record(self._transfer_stream)
@@ -668,7 +782,8 @@ def load_strata_coder_multi_gpu(
         num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
     num_gpus = max(num_gpus, 1)
 
-    # Reserve ~16% of VRAM for lm_head + workspace, ~20% of RAM for OS
+    # Reserve workspace on each card *after* existing engine allocations (e.g.
+    # GPU0's lm_head and dense layer). A summed VRAM budget cannot protect GPU0.
     total_usable_vram = total_vram_gb * 0.84
     usable_vram_per_layer = total_usable_vram / n_budget_layers
     usable_ram_per_layer = (total_ram_gb * 0.80) / n_budget_layers
@@ -677,14 +792,26 @@ def load_strata_coder_multi_gpu(
     if eager_preload is None:
         eager_preload = True
 
-    weight_sum = sum(layer_vram_weights.get(li, 1.0) for li in shard_paths) if layer_vram_weights else float(n_budget_layers)
+    layer_items = sorted(shard_paths.items())
+    gpu_for_layer = {li: (idx * num_gpus) // n_layers for idx, (li, _) in enumerate(layer_items)}
+    gpu_weights: Dict[int, float] = {}
+    for li, gpu_id in gpu_for_layer.items():
+        gpu_weights[gpu_id] = gpu_weights.get(gpu_id, 0.0) + (layer_vram_weights.get(li, 1.0) if layer_vram_weights else 1.0)
+    gpu_budgets = {}
+    if torch.cuda.is_available():
+        for gpu_id in gpu_weights:
+            dev = torch.device(f"cuda:{gpu_id}")
+            free, total = torch.cuda.mem_get_info(dev)
+            reusable = torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+            headroom_gb = max(0, free + reusable - total * 0.16) / (1024 ** 3)
+            gpu_budgets[gpu_id] = min(total_usable_vram / len(gpu_weights), headroom_gb)
     managers: Dict[int, TieredMoECacheManager] = {}
-    for idx, (layer_idx, spath) in enumerate(sorted(shard_paths.items())):
-        gpu_id = (idx * num_gpus) // n_layers
+    for layer_idx, spath in layer_items:
+        gpu_id = gpu_for_layer[layer_idx]
         dev = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
         l_vram_gb = (
-            total_usable_vram * (layer_vram_weights.get(layer_idx, 1.0) / max(weight_sum, 1e-6))
-            if layer_vram_weights
+            gpu_budgets[gpu_id] * ((layer_vram_weights.get(layer_idx, 1.0) if layer_vram_weights else 1.0) / max(gpu_weights[gpu_id], 1e-6))
+            if gpu_budgets
             else usable_vram_per_layer
         )
         p_override = layer_priority_overrides.get(layer_idx) if layer_priority_overrides else None
