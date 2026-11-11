@@ -396,6 +396,15 @@ class TieredMoECacheManager:
             key=lambda e: (self.expert_tiers[e], -scores[e], e),
         )
 
+    def _has_gpu_headroom(self, extra_bytes: int, min_free_bytes: int = 3_221_225_472) -> bool:
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return True
+        try:
+            free_b, _ = torch.cuda.mem_get_info(self.device)
+            return (free_b - extra_bytes) >= min_free_bytes
+        except Exception:
+            return True
+
     def _populate_tiers(self):
         vram_used = self.vram_used_bytes
         ram_used = self.ram_used_bytes
@@ -410,7 +419,7 @@ class TieredMoECacheManager:
             can_ram = self.preload_ram and (tier < 3 or self.promote_cold_to_ram)
             if tier in tier_bytes:
                 tb = tier_bytes[tier]
-                vram_fits = (vram_used + tb) <= self.vram_hot_budget_bytes
+                vram_fits = ((vram_used + tb) <= self.vram_hot_budget_bytes) and self._has_gpu_headroom(tb)
                 ram_fits = can_ram and ((ram_used + tb) <= self.ram_warm_budget_bytes)
                 if not vram_fits and not ram_fits:
                     if not self.preload_ram:
@@ -422,7 +431,7 @@ class TieredMoECacheManager:
                 break
             ebytes = sum(t.numel() * t.element_size() for t in entry.values())
             tier_bytes[tier] = ebytes
-            if vram_used + ebytes <= self.vram_hot_budget_bytes:
+            if (vram_used + ebytes <= self.vram_hot_budget_bytes) and self._has_gpu_headroom(ebytes):
                 gpu_e = {k: v.to(self.device, non_blocking=True) for k, v in entry.items()}
                 self.vram_cache[e] = gpu_e
                 self._vram_ptr_ready.add(e)
@@ -682,16 +691,29 @@ def load_strata_coder_multi_gpu(
         eager_preload = True
     preload_ram = len(shard_paths) <= 8 or os.environ.get("STRATA_PRELOAD_RAM") == "1"
 
-    weight_sum = sum(layer_vram_weights.get(li, 1.0) for li in shard_paths) if layer_vram_weights else float(n_budget_layers)
+    sorted_items = sorted(shard_paths.items())
+    gpu_layer_idxs: Dict[int, List[int]] = {g: [] for g in range(num_gpus)}
+    for idx, (layer_idx, _) in enumerate(sorted_items):
+        g = (idx * num_gpus) // n_layers
+        gpu_layer_idxs[g].append(layer_idx)
+
+    per_gpu_usable = total_usable_vram / num_gpus
     managers: Dict[int, TieredMoECacheManager] = {}
-    for idx, (layer_idx, spath) in enumerate(sorted(shard_paths.items())):
+    for idx, (layer_idx, spath) in enumerate(sorted_items):
         gpu_id = (idx * num_gpus) // n_layers
         dev = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
-        l_vram_gb = (
-            total_usable_vram * (layer_vram_weights.get(layer_idx, 1.0) / max(weight_sum, 1e-6))
-            if layer_vram_weights
-            else usable_vram_per_layer
-        )
+        g_layers = gpu_layer_idxs[gpu_id]
+        g_budget = per_gpu_usable
+        if num_gpus > 1 and n_layers > 8:
+            if gpu_id == 0:
+                g_budget = max(g_budget - 2.6, g_budget * 0.85)
+            elif gpu_id == num_gpus - 1:
+                g_budget = max(g_budget - 2.2, g_budget * 0.88)
+        if layer_vram_weights:
+            g_wsum = sum(layer_vram_weights.get(li, 1.0) for li in g_layers)
+            l_vram_gb = g_budget * (layer_vram_weights.get(layer_idx, 1.0) / max(g_wsum, 1e-6))
+        else:
+            l_vram_gb = g_budget / max(len(g_layers), 1)
         p_override = layer_priority_overrides.get(layer_idx) if layer_priority_overrides else None
         managers[layer_idx] = TieredMoECacheManager(
             shard_path=spath,

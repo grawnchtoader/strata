@@ -534,10 +534,12 @@ class KimiCoderEngine:
         out_rn_k = "language_model.model.output_attn_res_norm.weight"
         out_rp_k = "language_model.model.output_attn_res_proj.weight"
         if self.peer_addr is None:
-            self.out_attn_res_norm = self._sf94.get_tensor(out_rn_k).to(self.device) if out_rn_k in s94_keys else None
-            self.out_attn_res_proj = self._sf94.get_tensor(out_rp_k).to(self.device).squeeze() if out_rp_k in s94_keys else None
-            self.final_norm_w = self._sf94.get_tensor("language_model.model.norm.weight").to(self.device)
-            head_dev = self.device if self.total_vram_gb >= 12.0 else torch.device("cpu")
+            n_gpus = torch.cuda.device_count() if (self.device.type == "cuda" and torch.cuda.is_available()) else 1
+            tail_dev = torch.device(f"cuda:{n_gpus - 1}") if n_gpus > 1 else self.device
+            self.out_attn_res_norm = self._sf94.get_tensor(out_rn_k).to(tail_dev) if out_rn_k in s94_keys else None
+            self.out_attn_res_proj = self._sf94.get_tensor(out_rp_k).to(tail_dev).squeeze() if out_rp_k in s94_keys else None
+            self.final_norm_w = self._sf94.get_tensor("language_model.model.norm.weight").to(tail_dev)
+            head_dev = tail_dev if self.total_vram_gb >= 12.0 else torch.device("cpu")
             self.lm_head_w = self._sf94.get_tensor("language_model.lm_head.weight").to(device=head_dev, dtype=self.out_dtype)
         else:
             self.out_attn_res_norm = None
@@ -764,8 +766,9 @@ class KimiCoderEngine:
 
     @torch.no_grad()
     def _compute_final_logits(self, cur: torch.Tensor, bres: List[torch.Tensor]) -> torch.Tensor:
-        cur = cur.to(self.device)
-        bres = [b.to(self.device) for b in bres]
+        tail_dev = self.final_norm_w.device
+        cur = cur.to(tail_dev)
+        bres = [b.to(tail_dev) for b in bres]
         if bres and self.out_attn_res_norm is not None and self.out_attn_res_proj is not None:
             h_final = gpu_res_mix(cur[-1:], [b[-1:] for b in bres], self.out_attn_res_norm, self.out_attn_res_proj)
         else:
