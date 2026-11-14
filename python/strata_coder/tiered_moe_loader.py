@@ -1,9 +1,11 @@
 from concurrent.futures import Future, ThreadPoolExecutor
+import contextlib
 import ctypes
 import json
 import os
 import struct
 import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import torch
@@ -268,34 +270,52 @@ class TieredMoECacheManager:
                 and hasattr(torch, "float8_e4m3fn")
                 and torch.cuda.get_device_capability(self.device)[0] >= 8
             )
-            for k, t in items_sorted:
-                if t.dtype == torch.bfloat16 and self.out_dtype == torch.float16:
-                    t = t.float().clamp(-65504.0, 65504.0).to(torch.float16)
-                t_bytes = t.numel() * t.element_size()
-                need_fp8 = (self.vram_used_bytes + rem_bytes) > self.vram_base_budget_bytes
-                rem_bytes -= t_bytes
-                if not need_fp8 and (self.vram_used_bytes + t_bytes <= self.vram_base_budget_bytes):
-                    self.base_cache[k] = t.to(self.device, non_blocking=True)
-                    self.vram_used_bytes += t_bytes
-                elif (
-                    can_fp8
-                    and t.ndim == 2
-                    and t.element_size() == 2
-                    and t.numel() >= 8_000_000
-                    and (self.vram_used_bytes + (t_bytes // 2) + t.shape[0] * 4 <= self.vram_base_budget_bytes)
-                ):
-                    tf = t.to(self.device, non_blocking=True).float()
-                    sc = tf.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 448.0
-                    w_fp8 = (tf / sc).to(torch.float8_e4m3fn)
-                    del tf
-                    self.base_cache[k] = (w_fp8, sc.squeeze(1))
-                    self.vram_used_bytes += (t_bytes // 2) + t.shape[0] * 4
-                elif self.vram_used_bytes + t_bytes <= self.vram_base_budget_bytes:
-                    self.base_cache[k] = t.to(self.device, non_blocking=True)
-                    self.vram_used_bytes += t_bytes
-                else:
-                    self.base_cache[k] = t
-                    self.ram_used_bytes += t_bytes
+            dev_ctx = (
+                torch.cuda.device(self.device)
+                if (self.device.type == "cuda" and torch.cuda.is_available())
+                else contextlib.nullcontext()
+            )
+            with dev_ctx:
+                for k, t in items_sorted:
+                    if t.dtype == torch.bfloat16 and self.out_dtype == torch.float16:
+                        t = t.float().clamp(-65504.0, 65504.0).to(torch.float16)
+                    t_bytes = t.numel() * t.element_size()
+                    need_fp8 = (self.vram_used_bytes + rem_bytes) > self.vram_base_budget_bytes
+                    rem_bytes -= t_bytes
+                    try:
+                        if (
+                            not need_fp8
+                            and (self.vram_used_bytes + t_bytes <= self.vram_base_budget_bytes)
+                            and self._has_gpu_headroom(t_bytes)
+                        ):
+                            self.base_cache[k] = t.to(self.device, non_blocking=True)
+                            self.vram_used_bytes += t_bytes
+                        elif (
+                            can_fp8
+                            and t.ndim == 2
+                            and t.element_size() == 2
+                            and t.numel() >= 8_000_000
+                            and (self.vram_used_bytes + (t_bytes // 2) + t.shape[0] * 4 <= self.vram_base_budget_bytes)
+                            and self._has_gpu_headroom((t_bytes // 2) + t.shape[0] * 4)
+                        ):
+                            tf = t.to(self.device, non_blocking=True).float()
+                            sc = tf.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 448.0
+                            w_fp8 = (tf / sc).to(torch.float8_e4m3fn)
+                            del tf
+                            self.base_cache[k] = (w_fp8, sc.squeeze(1))
+                            self.vram_used_bytes += (t_bytes // 2) + t.shape[0] * 4
+                        elif (
+                            (self.vram_used_bytes + t_bytes <= self.vram_base_budget_bytes)
+                            and self._has_gpu_headroom(t_bytes)
+                        ):
+                            self.base_cache[k] = t.to(self.device, non_blocking=True)
+                            self.vram_used_bytes += t_bytes
+                        else:
+                            self.base_cache[k] = t
+                            self.ram_used_bytes += t_bytes
+                    except torch.OutOfMemoryError:
+                        self.base_cache[k] = t
+                        self.ram_used_bytes += t_bytes
             self._base_loaded = True
 
     def prefetch_base_weights_async(self):
@@ -317,12 +337,19 @@ class TieredMoECacheManager:
         ]
         if not cpu_items:
             return
-        with torch.cuda.stream(self._transfer_stream):
-            ev = torch.cuda.Event()
-            staged = {k: v.to(self.device, non_blocking=True) for k, v in cpu_items}
-            ev.record(self._transfer_stream)
-        for k, gt in staged.items():
-            self._base_gpu_stage[k] = (gt, ev)
+        total_b = sum(v.numel() * v.element_size() for _, v in cpu_items)
+        if not self._has_gpu_headroom(total_b):
+            return
+        try:
+            with torch.cuda.device(self.device):
+                with torch.cuda.stream(self._transfer_stream):
+                    ev = torch.cuda.Event()
+                    staged = {k: v.to(self.device, non_blocking=True) for k, v in cpu_items}
+                    ev.record(self._transfer_stream)
+            for k, gt in staged.items():
+                self._base_gpu_stage[k] = (gt, ev)
+        except torch.OutOfMemoryError:
+            self._base_gpu_stage.clear()
 
     def get_base_tensor(self, key: str, target_dev: torch.device):
         if not self._base_loaded:
@@ -405,50 +432,123 @@ class TieredMoECacheManager:
         except Exception:
             return True
 
+    def _estimate_expert_bytes(self, e: int) -> int:
+        if not self._hdr:
+            return 0
+        epfx = f"{self.pfx}experts.{e}."
+        total = 0
+        for proj in ("w1", "w2", "w3"):
+            for suffix in ("idx_packed", "scales", "u_svd", "v_svd"):
+                m = self._hdr.get(f"{epfx}{proj}.{suffix}")
+                if m is None:
+                    return 0
+                numel = 1
+                for dim in m["shape"]:
+                    numel *= dim
+                elem_sz = 2 if suffix != "idx_packed" else _SAFETENSORS_DTYPE_MAP[m["dtype"]].itemsize
+                total += numel * elem_sz
+        return total
+
     def _populate_tiers(self):
         vram_used = self.vram_used_bytes
         ram_used = self.ram_used_bytes
+        sim_vram = vram_used
+        sim_ram = ram_used
         tier_bytes: Dict[int, int] = {}
+        dev_ctx = (
+            torch.cuda.device(self.device)
+            if (self.device.type == "cuda" and torch.cuda.is_available())
+            else contextlib.nullcontext()
+        )
 
-        # Waterfall Bucket Filling:
-        #   Bucket 1 (GPU VRAM): Fills Tier 1 first, then promotes highest-priority Tier 2/3 if VRAM budget remains
-        #   Bucket 2 (System RAM): Fills remaining Tier 1/2, then promotes Tier 3 if RAM budget remains
-        #   Bucket 3 (NVMe mmap): Any remaining tail experts stay on disk (0 B VRAM, 0 B RAM)
+        def _flush_batch(batch_exps: List[int]) -> bool:
+            nonlocal vram_used, ram_used, sim_vram, sim_ram
+            if not batch_exps:
+                return False
+            b_keys: List[str] = []
+            for e_id in batch_exps:
+                epfx = f"{self.pfx}experts.{e_id}."
+                for proj in ("w1", "w2", "w3"):
+                    for suffix in ("idx_packed", "scales", "u_svd", "v_svd"):
+                        b_keys.append(f"{epfx}{proj}.{suffix}")
+            try:
+                loaded = self.batch_pread_tensors(b_keys, max_gap=262144, max_chunk=16 * 1024 * 1024)
+            except MemoryError:
+                return True
+            stop_early = False
+            with dev_ctx:
+                for e_id in batch_exps:
+                    epfx = f"{self.pfx}experts.{e_id}."
+                    entry: Dict[str, torch.Tensor] = {}
+                    for proj in ("w1", "w2", "w3"):
+                        for suffix in ("idx_packed", "scales", "u_svd", "v_svd"):
+                            t = loaded.pop(f"{epfx}{proj}.{suffix}")
+                            if suffix in ("scales", "u_svd", "v_svd") and t.dtype != torch.float16:
+                                t = t.float().clamp(-65504.0, 65504.0).to(torch.float16)
+                            entry[f"{proj}.{suffix}"] = t
+                    ebytes = sum(t.numel() * t.element_size() for t in entry.values())
+                    tier = self.expert_tiers[e_id]
+                    tier_bytes[tier] = ebytes
+                    can_ram = self.preload_ram and (tier < 3 or self.promote_cold_to_ram)
+                    placed_vram = False
+                    if (vram_used + ebytes <= self.vram_hot_budget_bytes) and self._has_gpu_headroom(ebytes):
+                        try:
+                            gpu_e = {k: v.to(self.device, non_blocking=True) for k, v in entry.items()}
+                            self.vram_cache[e_id] = gpu_e
+                            self._vram_ptr_ready.add(e_id)
+                            vram_used += ebytes
+                            placed_vram = True
+                            del entry
+                        except torch.OutOfMemoryError:
+                            placed_vram = False
+                    if not placed_vram:
+                        if can_ram and (ram_used + ebytes <= self.ram_warm_budget_bytes):
+                            self.ram_cache[e_id] = self._pin_dict(entry)
+                            ram_used += ebytes
+                        else:
+                            del entry
+                            if not self.preload_ram:
+                                stop_early = True
+                                break
+            loaded.clear()
+            sim_vram = vram_used
+            sim_ram = ram_used
+            return stop_early
+
+        batch: List[int] = []
         for e in self.priority_order:
             tier = self.expert_tiers[e]
             can_ram = self.preload_ram and (tier < 3 or self.promote_cold_to_ram)
-            if tier in tier_bytes:
-                tb = tier_bytes[tier]
-                vram_fits = ((vram_used + tb) <= self.vram_hot_budget_bytes) and self._has_gpu_headroom(tb)
-                ram_fits = can_ram and ((ram_used + tb) <= self.ram_warm_budget_bytes)
+            tb = self._estimate_expert_bytes(e) or tier_bytes.get(tier, 0)
+            if tb > 0:
+                vram_fits = ((sim_vram + tb) <= self.vram_hot_budget_bytes) and self._has_gpu_headroom(
+                    (sim_vram - vram_used) + tb
+                )
+                ram_fits = can_ram and ((sim_ram + tb) <= self.ram_warm_budget_bytes)
                 if not vram_fits and not ram_fits:
                     if not self.preload_ram:
                         break
                     continue
-            try:
-                entry = self._read_expert_raw(e, torch.device("cpu"))
-            except MemoryError:
-                break
-            ebytes = sum(t.numel() * t.element_size() for t in entry.values())
-            tier_bytes[tier] = ebytes
-            if (vram_used + ebytes <= self.vram_hot_budget_bytes) and self._has_gpu_headroom(ebytes):
-                gpu_e = {k: v.to(self.device, non_blocking=True) for k, v in entry.items()}
-                self.vram_cache[e] = gpu_e
-                self._vram_ptr_ready.add(e)
-                vram_used += ebytes
-                del entry
-            elif can_ram and (ram_used + ebytes <= self.ram_warm_budget_bytes):
-                self.ram_cache[e] = self._pin_dict(entry)
-                ram_used += ebytes
-            elif not self.preload_ram:
-                del entry
-                break
+                if vram_fits:
+                    sim_vram += tb
+                else:
+                    sim_ram += tb
+            batch.append(e)
+            if len(batch) >= 64 or (tb == 0 and not self.preload_ram and len(batch) >= 8):
+                if _flush_batch(batch):
+                    batch.clear()
+                    break
+                batch.clear()
+        if batch:
+            _flush_batch(batch)
+
         if self.vram_cache and self.device.type == "cuda":
-            idxs = sorted(self.vram_cache.keys())
-            rows = [self._make_ptr_row(e, self.vram_cache[e]) for e in idxs]
-            self.expert_ptr_table[torch.tensor(idxs, dtype=torch.long, device=self.device)] = torch.tensor(
-                rows, dtype=torch.int64, device=self.device
-            )
+            with dev_ctx:
+                idxs = sorted(self.vram_cache.keys())
+                rows = [self._make_ptr_row(e, self.vram_cache[e]) for e in idxs]
+                self.expert_ptr_table[torch.tensor(idxs, dtype=torch.long, device=self.device)] = torch.tensor(
+                    rows, dtype=torch.int64, device=self.device
+                )
         self.vram_used_bytes = vram_used
         self.ram_used_bytes = ram_used
 
@@ -475,20 +575,26 @@ class TieredMoECacheManager:
         b_p = self.lookahead_bias.get(lead)
         if b_p is not None:
             scores = scores + b_p.unsqueeze(0)
-        pred_idx = torch.topk(scores, k=min(top_k, scores.shape[-1]), dim=-1).indices.view(-1).tolist()
+        raw_idx = torch.topk(scores, k=min(top_k, scores.shape[-1]), dim=-1).indices.view(-1).tolist()
+        pred_idx = list(dict.fromkeys(raw_idx))
         target_mgr.prefetch_cold_experts_async(pred_idx)
         for e in pred_idx:
+            if len(target_mgr._gpu_stage_cache) >= 24:
+                break
             if e in target_mgr.ram_cache:
                 target_mgr.stage_expert_to_gpu_async(e)
 
     def prefetch_cold_experts_async(self, predicted_experts: List[int]):
         """RouterLookahead hook: asynchronously prefetches predicted Cold NVMe experts."""
         for e in predicted_experts:
+            if len(self.prefetch_buffer) >= 64:
+                break
             if e not in self.vram_cache and e not in self.ram_cache and e not in self.prefetch_buffer:
                 self._pool.submit(self._prefetch_worker, e)
 
     def _prefetch_worker(self, e: int):
-        self.prefetch_buffer[e] = self._read_expert_raw(e, torch.device("cpu"))
+        if len(self.prefetch_buffer) < 64:
+            self.prefetch_buffer[e] = self._read_expert_raw(e, torch.device("cpu"))
 
     def warm_experts_parallel(self, expert_ids: List[int]):
         missing = [
@@ -515,13 +621,42 @@ class TieredMoECacheManager:
                     entry[f"{proj}.{suffix}"] = t
             self.prefetch_buffer[e] = entry
 
+    def _clear_batch_keepalive(self):
+        if not self._last_batch_keepalive:
+            return
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            with torch.cuda.device(self.device):
+                cur_stream = torch.cuda.current_stream(self.device)
+                for raw in self._last_batch_keepalive:
+                    for t in raw.values():
+                        if t.is_cuda:
+                            t.record_stream(cur_stream)
+        self._last_batch_keepalive.clear()
+
+    def release_transient_gpu_cache(self):
+        """Releases per-layer transient GPU buffers and unconsumed lookahead stages cleanly on their streams."""
+        self._clear_batch_keepalive()
+        if self._gpu_stage_cache:
+            if self._transfer_stream is not None:
+                for raw, _ in self._gpu_stage_cache.values():
+                    for t in raw.values():
+                        if t.is_cuda:
+                            t.record_stream(self._transfer_stream)
+            self._gpu_stage_cache.clear()
+        if hasattr(self, "_base_gpu_stage") and self._base_gpu_stage:
+            if self._transfer_stream is not None:
+                for gt, _ in self._base_gpu_stage.values():
+                    if gt.is_cuda:
+                        gt.record_stream(self._transfer_stream)
+            self._base_gpu_stage.clear()
+
     @torch.no_grad()
     def get_experts_batch_ptrs_gpu(self, flat_e: torch.Tensor) -> torch.Tensor:
         """
         Ensures all routed experts in `flat_e` are staged in GPU memory and returns
         their [E, 14] int64 pointer table on GPU. Zero CPU round-trip when all experts are in VRAM.
         """
-        self._last_batch_keepalive.clear()
+        self._clear_batch_keepalive()
         if len(self._vram_ptr_ready) == len(self.expert_tiers):
             return self.expert_ptr_table.index_select(0, flat_e).contiguous()
         e_list = flat_e.tolist()
@@ -559,16 +694,44 @@ class TieredMoECacheManager:
     @torch.no_grad()
     def stage_expert_to_gpu_async(self, e: int):
         """Asynchronously stages a RAM/prefetched expert to GPU on the dedicated transfer stream."""
-        if self._transfer_stream is None or e in self.vram_cache or e in self._gpu_stage_cache:
+        if (
+            self._transfer_stream is None
+            or e in self.vram_cache
+            or e in self._gpu_stage_cache
+            or len(self._gpu_stage_cache) >= 24
+        ):
             return
         cpu_raw = self.ram_cache.get(e)
         if cpu_raw is None:
             return
-        with torch.cuda.stream(self._transfer_stream):
-            gpu_raw = {k: v.to(self.device, non_blocking=True) for k, v in cpu_raw.items()}
-            ev = torch.cuda.Event()
-            ev.record(self._transfer_stream)
-        self._gpu_stage_cache[e] = (gpu_raw, ev)
+        ebytes = sum(v.numel() * v.element_size() for v in cpu_raw.values())
+        if not self._has_gpu_headroom(ebytes):
+            return
+        try:
+            with torch.cuda.device(self.device):
+                with torch.cuda.stream(self._transfer_stream):
+                    gpu_raw = {k: v.to(self.device, non_blocking=True) for k, v in cpu_raw.items()}
+                    ev = torch.cuda.Event()
+                    ev.record(self._transfer_stream)
+            self._gpu_stage_cache[e] = (gpu_raw, ev)
+        except torch.OutOfMemoryError:
+            self.release_transient_gpu_cache()
+
+    def _copy_dict_to_gpu(self, src: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        dev_ctx = (
+            torch.cuda.device(self.device)
+            if (self.device.type == "cuda" and torch.cuda.is_available())
+            else contextlib.nullcontext()
+        )
+        try:
+            with dev_ctx:
+                return {k: v.to(self.device, non_blocking=True) for k, v in src.items()}
+        except torch.OutOfMemoryError:
+            self.release_transient_gpu_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            with dev_ctx:
+                return {k: v.to(self.device, non_blocking=True) for k, v in src.items()}
 
     @torch.no_grad()
     def get_expert_raw_gpu(self, e: int) -> Tuple[Dict[str, torch.Tensor], int, torch.Tensor, torch.Tensor, int]:
@@ -582,30 +745,35 @@ class TieredMoECacheManager:
             raw = self.vram_cache[e]
         elif e in self._gpu_stage_cache:
             raw, ev = self._gpu_stage_cache.pop(e)
-            cur_stream = torch.cuda.current_stream(self.device)
-            if ev is not None:
-                cur_stream.wait_event(ev)
-            for t in raw.values():
-                t.record_stream(cur_stream)
+            with torch.cuda.device(self.device):
+                cur_stream = torch.cuda.current_stream(self.device)
+                if ev is not None:
+                    cur_stream.wait_event(ev)
+                for t in raw.values():
+                    t.record_stream(cur_stream)
         elif e in self.ram_cache:
-            raw = {k: v.to(self.device, non_blocking=True) for k, v in self.ram_cache[e].items()}
+            raw = self._copy_dict_to_gpu(self.ram_cache[e])
         else:
             if e in self.prefetch_buffer:
                 cpu_raw = self.prefetch_buffer.pop(e)
             else:
                 cpu_raw = self._read_expert_raw(e, torch.device("cpu"))
             ebytes = sum(t.numel() * t.element_size() for t in cpu_raw.values())
-            if (tier == 1 or self.eager_preload) and (self.vram_used_bytes + ebytes <= self.vram_hot_budget_bytes):
-                raw = {k: v.to(self.device, non_blocking=True) for k, v in cpu_raw.items()}
+            if (
+                (tier == 1 or self.eager_preload)
+                and (self.vram_used_bytes + ebytes <= self.vram_hot_budget_bytes)
+                and self._has_gpu_headroom(ebytes)
+            ):
+                raw = self._copy_dict_to_gpu(cpu_raw)
                 self.vram_cache[e] = raw
                 self.vram_used_bytes += ebytes
             elif (tier < 3 or self.promote_cold_to_ram) and (self.ram_used_bytes + ebytes <= self.ram_warm_budget_bytes):
                 pinned_raw = self._pin_dict(cpu_raw)
                 self.ram_cache[e] = pinned_raw
                 self.ram_used_bytes += ebytes
-                raw = {k: v.to(self.device, non_blocking=True) for k, v in pinned_raw.items()}
+                raw = self._copy_dict_to_gpu(pinned_raw)
             else:
-                raw = {k: v.to(self.device, non_blocking=True) for k, v in cpu_raw.items()}
+                raw = self._copy_dict_to_gpu(cpu_raw)
                 del cpu_raw
         return raw, tier, lut, q_basis, bits
 
@@ -699,32 +867,53 @@ def load_strata_coder_multi_gpu(
 
     per_gpu_usable = total_usable_vram / num_gpus
     managers: Dict[int, TieredMoECacheManager] = {}
-    for idx, (layer_idx, spath) in enumerate(sorted_items):
-        gpu_id = (idx * num_gpus) // n_layers
-        dev = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
-        g_layers = gpu_layer_idxs[gpu_id]
-        g_budget = per_gpu_usable
-        if num_gpus > 1 and n_layers > 8:
-            if gpu_id == 0:
-                g_budget = max(g_budget - 2.6, g_budget * 0.85)
-            elif gpu_id == num_gpus - 1:
-                g_budget = max(g_budget - 2.2, g_budget * 0.88)
-        if layer_vram_weights:
-            g_wsum = sum(layer_vram_weights.get(li, 1.0) for li in g_layers)
-            l_vram_gb = g_budget * (layer_vram_weights.get(layer_idx, 1.0) / max(g_wsum, 1e-6))
-        else:
-            l_vram_gb = g_budget / max(len(g_layers), 1)
-        p_override = layer_priority_overrides.get(layer_idx) if layer_priority_overrides else None
-        managers[layer_idx] = TieredMoECacheManager(
-            shard_path=spath,
-            layer_idx=layer_idx,
-            device=dev,
-            vram_hot_budget_gb=l_vram_gb,
-            ram_warm_budget_gb=usable_ram_per_layer,
-            promote_cold_to_ram=promote_cold_to_ram,
-            force_arch_sm=force_arch_sm,
-            eager_preload=eager_preload,
-            vram_priority_override=p_override,
-            preload_ram=preload_ram,
-        )
+    t_load0 = time.time()
+    orig_threads = torch.get_num_threads()
+    if orig_threads > 4:
+        torch.set_num_threads(4)
+    try:
+        for idx, (layer_idx, spath) in enumerate(sorted_items):
+            gpu_id = (idx * num_gpus) // n_layers
+            dev = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+            g_layers = gpu_layer_idxs[gpu_id]
+            g_budget = per_gpu_usable
+            if num_gpus > 1 and n_layers > 8:
+                if gpu_id == 0:
+                    g_budget = max(g_budget - 2.6, g_budget * 0.85)
+                elif gpu_id == num_gpus - 1:
+                    g_budget = max(g_budget - 2.2, g_budget * 0.88)
+            if layer_vram_weights:
+                g_wsum = sum(layer_vram_weights.get(li, 1.0) for li in g_layers)
+                l_vram_gb = g_budget * (layer_vram_weights.get(layer_idx, 1.0) / max(g_wsum, 1e-6))
+            else:
+                l_vram_gb = g_budget / max(len(g_layers), 1)
+            p_override = layer_priority_overrides.get(layer_idx) if layer_priority_overrides else None
+            dev_ctx = torch.cuda.device(dev) if dev.startswith("cuda") else contextlib.nullcontext()
+            with dev_ctx:
+                mgr = TieredMoECacheManager(
+                    shard_path=spath,
+                    layer_idx=layer_idx,
+                    device=dev,
+                    vram_hot_budget_gb=l_vram_gb,
+                    ram_warm_budget_gb=usable_ram_per_layer,
+                    promote_cold_to_ram=promote_cold_to_ram,
+                    force_arch_sm=force_arch_sm,
+                    eager_preload=eager_preload,
+                    vram_priority_override=p_override,
+                    preload_ram=preload_ram,
+                )
+            managers[layer_idx] = mgr
+            if eager_preload and len(sorted_items) > 1:
+                tot_vram_gb = sum(m.vram_used_bytes for m in managers.values()) / (1024 ** 3)
+                tot_ram_gb = sum(m.ram_used_bytes for m in managers.values()) / (1024 ** 3)
+                print(
+                    f"[Strata-Coder] Loaded MoE layer {idx + 1}/{len(sorted_items)} "
+                    f"(layer {layer_idx}, {dev}) | VRAM: {tot_vram_gb:.1f} GB ({len(mgr.vram_cache)} hot) | "
+                    f"RAM: {tot_ram_gb:.1f} GB ({len(mgr.ram_cache)} warm) | "
+                    f"elapsed {time.time() - t_load0:.1f}s",
+                    flush=True,
+                )
+    finally:
+        if torch.get_num_threads() != orig_threads:
+            torch.set_num_threads(orig_threads)
     return managers

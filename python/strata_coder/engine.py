@@ -1,3 +1,4 @@
+import contextlib
 import os
 import json
 import shutil
@@ -27,6 +28,8 @@ from .tiered_moe_loader import (
     load_strata_coder_multi_gpu,
 )
 
+_KDA_TRITON_OK: Dict[int, bool] = {}
+
 if _HAS_TRITON:
     import triton
     import triton.language as tl
@@ -55,6 +58,15 @@ if _HAS_TRITON:
         tl.store(q_hist_ptr + 1 * 12288 + off, q2)
         tl.store(q_hist_ptr + 2 * 12288 + off, q3)
 
+        wq0 = tl.load(wc_q_ptr + off * 4 + 0).to(tl.float32)
+        wq1 = tl.load(wc_q_ptr + off * 4 + 1).to(tl.float32)
+        wq2 = tl.load(wc_q_ptr + off * 4 + 2).to(tl.float32)
+        wq3 = tl.load(wc_q_ptr + off * 4 + 3).to(tl.float32)
+        qc = q0 * wq0 + q1 * wq1 + q2 * wq2 + q3 * wq3
+        qs = qc * tl.sigmoid(qc)
+        q_norm = tl.sqrt(tl.maximum(tl.sum(qs * qs, axis=0), 1e-12))
+        qs = (qs / q_norm) * 0.08838834764831845
+
         k0 = tl.load(k_hist_ptr + 0 * 12288 + off).to(tl.float32)
         k1 = tl.load(k_hist_ptr + 1 * 12288 + off).to(tl.float32)
         k2 = tl.load(k_hist_ptr + 2 * 12288 + off).to(tl.float32)
@@ -63,37 +75,12 @@ if _HAS_TRITON:
         tl.store(k_hist_ptr + 1 * 12288 + off, k2)
         tl.store(k_hist_ptr + 2 * 12288 + off, k3)
 
-        v0 = tl.load(v_hist_ptr + 0 * 12288 + off).to(tl.float32)
-        v1 = tl.load(v_hist_ptr + 1 * 12288 + off).to(tl.float32)
-        v2 = tl.load(v_hist_ptr + 2 * 12288 + off).to(tl.float32)
-        v3 = tl.load(v_raw_ptr + off).to(tl.float32)
-        tl.store(v_hist_ptr + 0 * 12288 + off, v1)
-        tl.store(v_hist_ptr + 1 * 12288 + off, v2)
-        tl.store(v_hist_ptr + 2 * 12288 + off, v3)
-
-        wq0 = tl.load(wc_q_ptr + off * 4 + 0).to(tl.float32)
-        wq1 = tl.load(wc_q_ptr + off * 4 + 1).to(tl.float32)
-        wq2 = tl.load(wc_q_ptr + off * 4 + 2).to(tl.float32)
-        wq3 = tl.load(wc_q_ptr + off * 4 + 3).to(tl.float32)
-        qc = q0 * wq0 + q1 * wq1 + q2 * wq2 + q3 * wq3
-        qs = qc * tl.sigmoid(qc)
-
         wk0 = tl.load(wc_k_ptr + off * 4 + 0).to(tl.float32)
         wk1 = tl.load(wc_k_ptr + off * 4 + 1).to(tl.float32)
         wk2 = tl.load(wc_k_ptr + off * 4 + 2).to(tl.float32)
         wk3 = tl.load(wc_k_ptr + off * 4 + 3).to(tl.float32)
         kc = k0 * wk0 + k1 * wk1 + k2 * wk2 + k3 * wk3
         ks = kc * tl.sigmoid(kc)
-
-        wv0 = tl.load(wc_v_ptr + off * 4 + 0).to(tl.float32)
-        wv1 = tl.load(wc_v_ptr + off * 4 + 1).to(tl.float32)
-        wv2 = tl.load(wc_v_ptr + off * 4 + 2).to(tl.float32)
-        wv3 = tl.load(wc_v_ptr + off * 4 + 3).to(tl.float32)
-        vc = v0 * wv0 + v1 * wv1 + v2 * wv2 + v3 * wv3
-        vs = vc * tl.sigmoid(vc)
-
-        q_norm = tl.sqrt(tl.maximum(tl.sum(qs * qs, axis=0), 1e-12))
-        qs = (qs / q_norm) * 0.08838834764831845
         k_norm = tl.sqrt(tl.maximum(tl.sum(ks * ks, axis=0), 1e-12))
         ks = ks / k_norm
 
@@ -102,21 +89,43 @@ if _HAS_TRITON:
         alp = tl.exp(-5.0 * tl.sigmoid(A_h * z_d))
         beta = tl.sigmoid(tl.load(beta_in_ptr + h).to(tl.float32))
 
-        e = tl.arange(0, 128)
-        s_off = h * 16384 + d[:, None] * 128 + e[None, :]
-        S = tl.load(S_ptr + s_off).to(tl.float32)
-        S = S * alp[:, None]
-        proj = tl.sum(ks[:, None] * S, axis=0)
-        delta = beta * (vs - proj)
-        S = S + ks[:, None] * delta[None, :]
-        tl.store(S_ptr + s_off, S)
+        for e0 in range(0, 128, 32):
+            e_blk = e0 + tl.arange(0, 32)
+            off_e = h * 128 + e_blk
 
-        o = tl.sum(qs[:, None] * S, axis=0)
-        o_rms = tl.rsqrt(tl.sum(o * o, axis=0) * (1.0 / 128.0) + 1e-5)
-        nw = tl.load(o_norm_w_ptr + e).to(tl.float32)
-        g_in = tl.load(gate_in_ptr + h * 128 + e).to(tl.float32)
-        out = (o * o_rms * nw) * tl.sigmoid(g_in)
-        tl.store(out_ptr + h * 128 + e, out)
+            v0 = tl.load(v_hist_ptr + 0 * 12288 + off_e).to(tl.float32)
+            v1 = tl.load(v_hist_ptr + 1 * 12288 + off_e).to(tl.float32)
+            v2 = tl.load(v_hist_ptr + 2 * 12288 + off_e).to(tl.float32)
+            v3 = tl.load(v_raw_ptr + off_e).to(tl.float32)
+            tl.store(v_hist_ptr + 0 * 12288 + off_e, v1)
+            tl.store(v_hist_ptr + 1 * 12288 + off_e, v2)
+            tl.store(v_hist_ptr + 2 * 12288 + off_e, v3)
+
+            wv0 = tl.load(wc_v_ptr + off_e * 4 + 0).to(tl.float32)
+            wv1 = tl.load(wc_v_ptr + off_e * 4 + 1).to(tl.float32)
+            wv2 = tl.load(wc_v_ptr + off_e * 4 + 2).to(tl.float32)
+            wv3 = tl.load(wc_v_ptr + off_e * 4 + 3).to(tl.float32)
+            vc = v0 * wv0 + v1 * wv1 + v2 * wv2 + v3 * wv3
+            vs_blk = vc * tl.sigmoid(vc)
+
+            s_off = h * 16384 + d[:, None] * 128 + e_blk[None, :]
+            S_blk = tl.load(S_ptr + s_off).to(tl.float32)
+            S_blk = S_blk * alp[:, None]
+            proj_blk = tl.sum(ks[:, None] * S_blk, axis=0)
+            delta_blk = beta * (vs_blk - proj_blk)
+            S_blk = S_blk + ks[:, None] * delta_blk[None, :]
+            tl.store(S_ptr + s_off, S_blk)
+
+            o_blk = tl.sum(qs[:, None] * S_blk, axis=0)
+            tl.store(out_ptr + off_e, o_blk)
+
+        tl.debug_barrier()
+        o_full = tl.load(out_ptr + off).to(tl.float32)
+        o_rms = tl.rsqrt(tl.sum(o_full * o_full, axis=0) * (1.0 / 128.0) + 1e-5)
+        nw = tl.load(o_norm_w_ptr + d).to(tl.float32)
+        g_in = tl.load(gate_in_ptr + off).to(tl.float32)
+        out = (o_full * o_rms * nw) * tl.sigmoid(g_in)
+        tl.store(out_ptr + off, out)
 
 FULL_ATTN_LAYERS = {
     3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47,
@@ -206,32 +215,51 @@ def gpu_kda_forward(
     o_norm_w = _fetch_weight(sf, cache_mgr, f"{p}.o_norm.weight", device)
     o_w = _fetch_weight(sf, cache_mgr, f"{p}.o_proj.weight", device)
 
-    if L == 1 and _HAS_TRITON and nrm.is_cuda and layer_state is not None and "S" in layer_state:
-        z_raw = _mm(_mm(nrm, f_a), f_b)
-        beta_in = _mm(nrm, b_w)
-        gate_in = _mm(nrm, g_w)
-        A_log = _fetch_weight(sf, cache_mgr, f"{p}.A_log", device)
-        dt_w = _fetch_weight(sf, cache_mgr, f"{p}.dt_bias", device)
-        q_hist = layer_state["q_hist"].to(device, dtype=torch.float32).contiguous()
-        k_hist = layer_state["k_hist"].to(device, dtype=torch.float32).contiguous()
-        v_hist = layer_state["v_hist"].to(device, dtype=torch.float32).contiguous()
-        S = layer_state["S"].to(device, dtype=torch.float32).contiguous()
-        layer_state["q_hist"] = q_hist
-        layer_state["k_hist"] = k_hist
-        layer_state["v_hist"] = v_hist
-        layer_state["S"] = S
-        gated_out = torch.empty((1, H * D), device=device, dtype=torch.float32)
-        _kda_decode_step_kernel[(H,)](
-            q_raw, k_raw, v_raw,
-            q_hist, k_hist, v_hist,
-            wc_q, wc_k, wc_v,
-            z_raw, A_log, dt_w,
-            beta_in, gate_in,
-            o_norm_w,
-            S,
-            gated_out,
-        )
-        return _mm(gated_out, o_w)
+    dev_idx = device.index or 0
+    if (
+        L == 1
+        and _HAS_TRITON
+        and nrm.is_cuda
+        and layer_state is not None
+        and "S" in layer_state
+        and _KDA_TRITON_OK.get(dev_idx, True)
+    ):
+        try:
+            verified = _KDA_TRITON_OK.get(dev_idx, False)
+            z_raw = _mm(_mm(nrm, f_a), f_b)
+            beta_in = _mm(nrm, b_w)
+            gate_in = _mm(nrm, g_w)
+            A_log = _fetch_weight(sf, cache_mgr, f"{p}.A_log", device)
+            dt_w = _fetch_weight(sf, cache_mgr, f"{p}.dt_bias", device)
+            q_hist = layer_state["q_hist"].to(device, dtype=torch.float32)
+            k_hist = layer_state["k_hist"].to(device, dtype=torch.float32)
+            v_hist = layer_state["v_hist"].to(device, dtype=torch.float32)
+            S = layer_state["S"].to(device, dtype=torch.float32)
+            if not verified:
+                q_hist, k_hist, v_hist, S = q_hist.clone(), k_hist.clone(), v_hist.clone(), S.clone()
+            else:
+                q_hist, k_hist, v_hist, S = q_hist.contiguous(), k_hist.contiguous(), v_hist.contiguous(), S.contiguous()
+            gated_out = torch.empty((1, H * D), device=device, dtype=torch.float32)
+            _kda_decode_step_kernel[(H,)](
+                q_raw, k_raw, v_raw,
+                q_hist, k_hist, v_hist,
+                wc_q, wc_k, wc_v,
+                z_raw, A_log, dt_w,
+                beta_in, gate_in,
+                o_norm_w,
+                S,
+                gated_out,
+            )
+            layer_state["q_hist"] = q_hist
+            layer_state["k_hist"] = k_hist
+            layer_state["v_hist"] = v_hist
+            layer_state["S"] = S
+            _KDA_TRITON_OK[dev_idx] = True
+            return _mm(gated_out, o_w)
+        except torch.OutOfMemoryError:
+            raise
+        except Exception:
+            _KDA_TRITON_OK[dev_idx] = False
 
     z = _mm(_mm(nrm, f_a), f_b).view(L, H, D) + dt
     alp_s = torch.exp(lb * torch.sigmoid(A * z))
@@ -350,7 +378,7 @@ def gpu_moe_forward(
     sh_u = _mm(nrm, _fetch_weight(sf, cache_mgr, f"{p}.shared_experts.up_proj.weight", device))
     sh_out = _mm(gpu_situ(sh_g, sh_u), _fetch_weight(sf, cache_mgr, f"{p}.shared_experts.down_proj.weight", device))
 
-    if cache_mgr is not None and cache_mgr.lookahead_w:
+    if T == 1 and cache_mgr is not None and cache_mgr.lookahead_w:
         base_vec = (res_base + sh_out) if res_base is not None else (nrm + sh_out)
         bf = base_vec.float()
         x0_normed = bf * torch.rsqrt(bf.pow(2).mean(-1, keepdim=True) + 1e-5)
@@ -373,99 +401,103 @@ def gpu_moe_forward(
     z = _mm(nrm, lat_dn)
     flat_e = topk_idx.view(-1)
 
-    if cache_mgr is not None and _HAS_TRITON and nrm.is_cuda:
-        if T <= 8:
-            ptrs = cache_mgr.get_experts_batch_ptrs_gpu(flat_e)
-            if T == 1:
-                flat_t_i64 = torch.zeros(K, device=device, dtype=torch.int64)
-            else:
-                flat_t_i64 = torch.arange(T, device=device, dtype=torch.int64).unsqueeze(1).expand(T, K).reshape(-1)
-            u = sc_lut_batched_experts_mlp(
-                z=z,
-                ptrs=ptrs,
-                flat_w=topk_w.view(-1).contiguous(),
-                flat_t=flat_t_i64,
-                luts_T_f32=cache_mgr.luts_T_f32,
-                qb_T_f32=cache_mgr.qb_T_f32,
-                qb_T_stack=cache_mgr.qb_T_stack,
-            )
-        else:
-            u_chunks = []
-            chunk_t = 8
-            for t0 in range(0, T, chunk_t):
-                t1 = min(t0 + chunk_t, T)
-                tc = t1 - t0
-                sub_e = topk_idx[t0:t1].reshape(-1)
-                sub_w = topk_w[t0:t1].reshape(-1).contiguous()
-                ptrs = cache_mgr.get_experts_batch_ptrs_gpu(sub_e)
-                flat_t_i64 = torch.arange(tc, device=device, dtype=torch.int64).unsqueeze(1).expand(tc, K).reshape(-1)
-                u_c = sc_lut_batched_experts_mlp(
-                    z=z[t0:t1],
+    try:
+        if cache_mgr is not None and _HAS_TRITON and nrm.is_cuda:
+            if T <= 8:
+                ptrs = cache_mgr.get_experts_batch_ptrs_gpu(flat_e)
+                if T == 1:
+                    flat_t_i64 = torch.zeros(K, device=device, dtype=torch.int64)
+                else:
+                    flat_t_i64 = torch.arange(T, device=device, dtype=torch.int64).unsqueeze(1).expand(T, K).reshape(-1)
+                u = sc_lut_batched_experts_mlp(
+                    z=z,
                     ptrs=ptrs,
-                    flat_w=sub_w,
+                    flat_w=topk_w.view(-1).contiguous(),
                     flat_t=flat_t_i64,
                     luts_T_f32=cache_mgr.luts_T_f32,
                     qb_T_f32=cache_mgr.qb_T_f32,
                     qb_T_stack=cache_mgr.qb_T_stack,
                 )
-                u_chunks.append(u_c)
-            u = torch.cat(u_chunks, dim=0)
+            else:
+                u_chunks = []
+                chunk_t = 8
+                for t0 in range(0, T, chunk_t):
+                    t1 = min(t0 + chunk_t, T)
+                    tc = t1 - t0
+                    sub_e = topk_idx[t0:t1].reshape(-1)
+                    sub_w = topk_w[t0:t1].reshape(-1).contiguous()
+                    ptrs = cache_mgr.get_experts_batch_ptrs_gpu(sub_e)
+                    flat_t_i64 = torch.arange(tc, device=device, dtype=torch.int64).unsqueeze(1).expand(tc, K).reshape(-1)
+                    u_c = sc_lut_batched_experts_mlp(
+                        z=z[t0:t1],
+                        ptrs=ptrs,
+                        flat_w=sub_w,
+                        flat_t=flat_t_i64,
+                        luts_T_f32=cache_mgr.luts_T_f32,
+                        qb_T_f32=cache_mgr.qb_T_f32,
+                        qb_T_stack=cache_mgr.qb_T_stack,
+                    )
+                    u_chunks.append(u_c)
+                u = torch.cat(u_chunks, dim=0)
+            y = _mm(gpu_rmsnorm(u, lat_nw, 1e-5), lat_up)
+            return y + sh_out
+
+        u = torch.zeros_like(z)
+        flat_t = torch.arange(T, device=device).unsqueeze(1).expand(T, K).reshape(-1)
+        flat_w = topk_w.view(-1, 1)
+        order = torch.argsort(flat_e)
+        sorted_e = flat_e[order]
+        sorted_t = flat_t[order]
+        sorted_w = flat_w[order]
+        uniq_e, counts = torch.unique_consecutive(sorted_e, return_counts=True)
+
+        uniq_e_list = uniq_e.tolist()
+        counts_list = counts.tolist()
+
+        if cache_mgr is not None:
+            cache_mgr.warm_experts_parallel(uniq_e_list)
+            dotluts = {
+                t: build_dotlut(z, cache_mgr.luts[t], cache_mgr.q_bases[t])
+                for t in cache_mgr.luts
+            }
+            if uniq_e_list:
+                cache_mgr.stage_expert_to_gpu_async(uniq_e_list[0])
+        else:
+            expert_tiers = sf.get_tensor(f"{p}.expert_tiers").tolist()
+            luts = {t: sf.get_tensor(f"{p}.sc_lut_tier{t}").to(device).float() for t in (1, 2, 3)}
+            qbases = {t: sf.get_tensor(f"{p}.sc_qbasis_tier{t}").to(device).float() for t in (1, 2, 3)}
+            dotluts = {t: build_dotlut(z, luts[t], qbases[t]) for t in (1, 2, 3)}
+
+        offset = 0
+        for idx_e, (e_val, cnt) in enumerate(zip(uniq_e_list, counts_list)):
+            tok_ids = sorted_t[offset : offset + cnt]
+            w_tok = sorted_w[offset : offset + cnt]
+            offset += cnt
+            z_e = z[tok_ids]
+            if cache_mgr is not None:
+                if idx_e + 1 < len(uniq_e_list):
+                    cache_mgr.stage_expert_to_gpu_async(uniq_e_list[idx_e + 1])
+                raw_gpu, tier, lut, q_basis, bits = cache_mgr.get_expert_raw_gpu(e_val)
+                dotlut_e = dotluts[tier].index_select(0, tok_ids)
+                eo = sc_lut_expert_mlp(z_e, raw_gpu, lut, q_basis, bits, dotlut_z=dotlut_e)
+            else:
+                ep = f"{p}.experts.{e_val}"
+                raw_t = int(expert_tiers[e_val])
+                tier = raw_t + 1 if 0 in expert_tiers else raw_t
+                bits = TIER_BITS[tier]
+                raw_gpu = {}
+                for proj in ("w1", "w2", "w3"):
+                    for suffix in ("idx_packed", "scales", "u_svd", "v_svd"):
+                        raw_gpu[f"{proj}.{suffix}"] = sf.get_tensor(f"{ep}.{proj}.{suffix}").to(device, non_blocking=True)
+                dotlut_e = dotluts[tier].index_select(0, tok_ids)
+                eo = sc_lut_expert_mlp(z_e, raw_gpu, luts[tier], qbases[tier], bits, dotlut_z=dotlut_e)
+            u.index_add_(0, tok_ids, eo * w_tok)
+
         y = _mm(gpu_rmsnorm(u, lat_nw, 1e-5), lat_up)
         return y + sh_out
-
-    u = torch.zeros_like(z)
-    flat_t = torch.arange(T, device=device).unsqueeze(1).expand(T, K).reshape(-1)
-    flat_w = topk_w.view(-1, 1)
-    order = torch.argsort(flat_e)
-    sorted_e = flat_e[order]
-    sorted_t = flat_t[order]
-    sorted_w = flat_w[order]
-    uniq_e, counts = torch.unique_consecutive(sorted_e, return_counts=True)
-
-    uniq_e_list = uniq_e.tolist()
-    counts_list = counts.tolist()
-
-    if cache_mgr is not None:
-        cache_mgr.warm_experts_parallel(uniq_e_list)
-        dotluts = {
-            t: build_dotlut(z, cache_mgr.luts[t], cache_mgr.q_bases[t])
-            for t in cache_mgr.luts
-        }
-        if uniq_e_list:
-            cache_mgr.stage_expert_to_gpu_async(uniq_e_list[0])
-    else:
-        expert_tiers = sf.get_tensor(f"{p}.expert_tiers").tolist()
-        luts = {t: sf.get_tensor(f"{p}.sc_lut_tier{t}").to(device).float() for t in (1, 2, 3)}
-        qbases = {t: sf.get_tensor(f"{p}.sc_qbasis_tier{t}").to(device).float() for t in (1, 2, 3)}
-        dotluts = {t: build_dotlut(z, luts[t], qbases[t]) for t in (1, 2, 3)}
-
-    offset = 0
-    for idx_e, (e_val, cnt) in enumerate(zip(uniq_e_list, counts_list)):
-        tok_ids = sorted_t[offset : offset + cnt]
-        w_tok = sorted_w[offset : offset + cnt]
-        offset += cnt
-        z_e = z[tok_ids]
+    finally:
         if cache_mgr is not None:
-            if idx_e + 1 < len(uniq_e_list):
-                cache_mgr.stage_expert_to_gpu_async(uniq_e_list[idx_e + 1])
-            raw_gpu, tier, lut, q_basis, bits = cache_mgr.get_expert_raw_gpu(e_val)
-            dotlut_e = dotluts[tier].index_select(0, tok_ids)
-            eo = sc_lut_expert_mlp(z_e, raw_gpu, lut, q_basis, bits, dotlut_z=dotlut_e)
-        else:
-            ep = f"{p}.experts.{e_val}"
-            raw_t = int(expert_tiers[e_val])
-            tier = raw_t + 1 if 0 in expert_tiers else raw_t
-            bits = TIER_BITS[tier]
-            raw_gpu = {}
-            for proj in ("w1", "w2", "w3"):
-                for suffix in ("idx_packed", "scales", "u_svd", "v_svd"):
-                    raw_gpu[f"{proj}.{suffix}"] = sf.get_tensor(f"{ep}.{proj}.{suffix}").to(device, non_blocking=True)
-            dotlut_e = dotluts[tier].index_select(0, tok_ids)
-            eo = sc_lut_expert_mlp(z_e, raw_gpu, luts[tier], qbases[tier], bits, dotlut_z=dotlut_e)
-        u.index_add_(0, tok_ids, eo * w_tok)
-
-    y = _mm(gpu_rmsnorm(u, lat_nw, 1e-5), lat_up)
-    return y + sh_out
+            cache_mgr.release_transient_gpu_cache()
 
 
 class KimiCoderEngine:
@@ -526,7 +558,11 @@ class KimiCoderEngine:
             self.shard1_path, _ = self._resolve_shard(1, keep_cached=True)
             self._sf1 = safe_open(self.shard1_path, framework="pt", device="cpu")
             l0_dev = self.device if self.total_vram_gb >= 12.0 else torch.device("cpu")
-            self.layer0_cache = {k: self._sf1.get_tensor(k).to(l0_dev) for k in self._sf1.keys()}
+            for k in self._sf1.keys():
+                t = self._sf1.get_tensor(k)
+                if t.dtype == torch.bfloat16 and self.out_dtype == torch.float16:
+                    t = t.float().clamp(-65504.0, 65504.0).to(torch.float16)
+                self.layer0_cache[k] = t.to(l0_dev)
 
         self.shard94_path, _ = self._resolve_shard(94, keep_cached=True)
         self._sf94 = safe_open(self.shard94_path, framework="pt", device="cpu")
@@ -536,11 +572,18 @@ class KimiCoderEngine:
         if self.peer_addr is None:
             n_gpus = torch.cuda.device_count() if (self.device.type == "cuda" and torch.cuda.is_available()) else 1
             tail_dev = torch.device(f"cuda:{n_gpus - 1}") if n_gpus > 1 else self.device
-            self.out_attn_res_norm = self._sf94.get_tensor(out_rn_k).to(tail_dev) if out_rn_k in s94_keys else None
-            self.out_attn_res_proj = self._sf94.get_tensor(out_rp_k).to(tail_dev).squeeze() if out_rp_k in s94_keys else None
-            self.final_norm_w = self._sf94.get_tensor("language_model.model.norm.weight").to(tail_dev)
-            head_dev = tail_dev if self.total_vram_gb >= 12.0 else torch.device("cpu")
-            self.lm_head_w = self._sf94.get_tensor("language_model.lm_head.weight").to(device=head_dev, dtype=self.out_dtype)
+            tail_ctx = torch.cuda.device(tail_dev) if tail_dev.type == "cuda" else contextlib.nullcontext()
+            with tail_ctx:
+                self.out_attn_res_norm = self._sf94.get_tensor(out_rn_k).float().to(tail_dev) if out_rn_k in s94_keys else None
+                self.out_attn_res_proj = self._sf94.get_tensor(out_rp_k).float().to(tail_dev).squeeze() if out_rp_k in s94_keys else None
+                self.final_norm_w = self._sf94.get_tensor("language_model.model.norm.weight").float().to(tail_dev)
+                head_dev = tail_dev if self.total_vram_gb >= 12.0 else torch.device("cpu")
+                lm_w = self._sf94.get_tensor("language_model.lm_head.weight")
+                if lm_w.dtype == torch.bfloat16 and self.out_dtype == torch.float16:
+                    lm_w = lm_w.float().clamp(-65504.0, 65504.0).to(torch.float16)
+                else:
+                    lm_w = lm_w.to(dtype=self.out_dtype)
+                self.lm_head_w = lm_w.to(device=head_dev)
         else:
             self.out_attn_res_norm = None
             self.out_attn_res_proj = None
@@ -696,85 +739,89 @@ class KimiCoderEngine:
             if next_mgr is not None:
                 next_mgr.prefetch_base_weights_async()
             layer_dev = mgr.device if mgr is not None else self.device
-            cur = cur.to(layer_dev)
-            bres = [b.to(layer_dev) for b in bres]
+            dev_ctx = torch.cuda.device(layer_dev) if layer_dev.type == "cuda" else contextlib.nullcontext()
+            with dev_ctx:
+                cur = cur.to(layer_dev)
+                bres = [b.to(layer_dev) for b in bres]
 
-            tmp_dir = None
-            sf_ctx = None
-            if li == 0:
-                sf = self.layer0_cache
-            elif mgr is not None:
-                sf = mgr._sf
-            else:
-                spath, tmp_dir = self._resolve_shard(shard_idx)
-                if tmp_dir is None:
-                    mgr = TieredMoECacheManager(
-                        shard_path=spath,
-                        layer_idx=li,
-                        device=str(self.device),
-                        vram_hot_budget_gb=(self.total_vram_gb * 0.84) / num_local,
-                        ram_warm_budget_gb=(self.total_ram_gb * 0.80) / num_local,
-                        promote_cold_to_ram=True,
-                        force_arch_sm=self.force_arch_sm,
-                        eager_preload=False,
-                    )
-                    self.layer_managers[li] = mgr
+                tmp_dir = None
+                sf_ctx = None
+                if li == 0:
+                    sf = self.layer0_cache
+                elif mgr is not None:
                     sf = mgr._sf
                 else:
-                    sf_ctx = safe_open(spath, framework="pt", device="cpu")
-                    sf = sf_ctx.__enter__()
-            try:
-                lp = f"language_model.model.layers.{li}"
-                if bres:
-                    rn_a = _fetch_weight(sf, mgr, f"{lp}.self_attention_res_norm.weight", layer_dev)
-                    rp_a = _fetch_weight(sf, mgr, f"{lp}.self_attention_res_proj.weight", layer_dev).squeeze()
-                    h_in = gpu_res_mix(cur, bres, rn_a, rp_a)
-                else:
-                    h_in = cur
-                if li % 12 == 0:
-                    bres.append(cur)
-                    have_prefix = False
-                else:
-                    have_prefix = True
-                nrm_a = gpu_rmsnorm(h_in, _fetch_weight(sf, mgr, f"{lp}.input_layernorm.weight", layer_dev))
-                l_state = layer_out_cache.setdefault(li, {}) if layer_out_cache is not None else None
-                if li in FULL_ATTN_LAYERS:
-                    ao = gpu_mla_forward(sf, li, nrm_a, layer_dev, mgr, layer_state=l_state)
-                else:
-                    ao = gpu_kda_forward(sf, li, nrm_a, layer_dev, mgr, layer_state=l_state)
-                cur = (cur + ao) if have_prefix else ao
+                    spath, tmp_dir = self._resolve_shard(shard_idx)
+                    if tmp_dir is None:
+                        mgr = TieredMoECacheManager(
+                            shard_path=spath,
+                            layer_idx=li,
+                            device=str(self.device),
+                            vram_hot_budget_gb=(self.total_vram_gb * 0.84) / num_local,
+                            ram_warm_budget_gb=(self.total_ram_gb * 0.80) / num_local,
+                            promote_cold_to_ram=True,
+                            force_arch_sm=self.force_arch_sm,
+                            eager_preload=False,
+                        )
+                        self.layer_managers[li] = mgr
+                        sf = mgr._sf
+                    else:
+                        sf_ctx = safe_open(spath, framework="pt", device="cpu")
+                        sf = sf_ctx.__enter__()
+                try:
+                    lp = f"language_model.model.layers.{li}"
+                    if bres:
+                        rn_a = _fetch_weight(sf, mgr, f"{lp}.self_attention_res_norm.weight", layer_dev)
+                        rp_a = _fetch_weight(sf, mgr, f"{lp}.self_attention_res_proj.weight", layer_dev).squeeze()
+                        h_in = gpu_res_mix(cur, bres, rn_a, rp_a)
+                    else:
+                        h_in = cur
+                    if li % 12 == 0:
+                        bres.append(cur)
+                        have_prefix = False
+                    else:
+                        have_prefix = True
+                    nrm_a = gpu_rmsnorm(h_in, _fetch_weight(sf, mgr, f"{lp}.input_layernorm.weight", layer_dev))
+                    l_state = layer_out_cache.setdefault(li, {}) if layer_out_cache is not None else None
+                    if li in FULL_ATTN_LAYERS:
+                        ao = gpu_mla_forward(sf, li, nrm_a, layer_dev, mgr, layer_state=l_state)
+                    else:
+                        ao = gpu_kda_forward(sf, li, nrm_a, layer_dev, mgr, layer_state=l_state)
+                    cur = (cur + ao) if have_prefix else ao
 
-                rn_m = _fetch_weight(sf, mgr, f"{lp}.mlp_res_norm.weight", layer_dev)
-                rp_m = _fetch_weight(sf, mgr, f"{lp}.mlp_res_proj.weight", layer_dev).squeeze()
-                h_mlp = gpu_res_mix(cur, bres, rn_m, rp_m)
-                nrm_m = gpu_rmsnorm(h_mlp, _fetch_weight(sf, mgr, f"{lp}.post_attention_layernorm.weight", layer_dev))
-                if li == 0:
-                    mo = gpu_dense(sf, li, nrm_m, layer_dev)
-                    cur = cur + mo
-                elif li == self.max_layers - 1 and cur.shape[0] > 1:
-                    mo_last = gpu_moe_forward(sf, li, nrm_m[-1:], layer_dev, mgr, next_mgr, self.force_arch_sm, next2_mgr, cur[-1:])
-                    cur = torch.cat([cur[:-1], cur[-1:] + mo_last], dim=0)
-                else:
-                    mo = gpu_moe_forward(sf, li, nrm_m, layer_dev, mgr, next_mgr, self.force_arch_sm, next2_mgr, cur)
-                    cur = cur + mo
-            finally:
-                if sf_ctx is not None:
-                    sf_ctx.__exit__(None, None, None)
-                if tmp_dir is not None:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    rn_m = _fetch_weight(sf, mgr, f"{lp}.mlp_res_norm.weight", layer_dev)
+                    rp_m = _fetch_weight(sf, mgr, f"{lp}.mlp_res_proj.weight", layer_dev).squeeze()
+                    h_mlp = gpu_res_mix(cur, bres, rn_m, rp_m)
+                    nrm_m = gpu_rmsnorm(h_mlp, _fetch_weight(sf, mgr, f"{lp}.post_attention_layernorm.weight", layer_dev))
+                    if li == 0:
+                        mo = gpu_dense(sf, li, nrm_m, layer_dev)
+                        cur = cur + mo
+                    elif li == self.max_layers - 1 and cur.shape[0] > 1:
+                        mo_last = gpu_moe_forward(sf, li, nrm_m[-1:], layer_dev, mgr, next_mgr, self.force_arch_sm, next2_mgr, cur[-1:])
+                        cur = torch.cat([cur[:-1], cur[-1:] + mo_last], dim=0)
+                    else:
+                        mo = gpu_moe_forward(sf, li, nrm_m, layer_dev, mgr, next_mgr, self.force_arch_sm, next2_mgr, cur)
+                        cur = cur + mo
+                finally:
+                    if sf_ctx is not None:
+                        sf_ctx.__exit__(None, None, None)
+                    if tmp_dir is not None:
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
         return cur, bres
 
     @torch.no_grad()
     def _compute_final_logits(self, cur: torch.Tensor, bres: List[torch.Tensor]) -> torch.Tensor:
         tail_dev = self.final_norm_w.device
-        cur = cur.to(tail_dev)
-        bres = [b.to(tail_dev) for b in bres]
-        if bres and self.out_attn_res_norm is not None and self.out_attn_res_proj is not None:
-            h_final = gpu_res_mix(cur[-1:], [b[-1:] for b in bres], self.out_attn_res_norm, self.out_attn_res_proj)
-        else:
-            h_final = cur[-1:]
-        h_last = gpu_rmsnorm(h_final, self.final_norm_w)
-        logits = (h_last.to(device=self.lm_head_w.device, dtype=self.lm_head_w.dtype) @ self.lm_head_w.T).float().squeeze(0)
+        tail_ctx = torch.cuda.device(tail_dev) if tail_dev.type == "cuda" else contextlib.nullcontext()
+        with tail_ctx:
+            cur = cur.to(tail_dev)
+            bres = [b.to(tail_dev) for b in bres]
+            if bres and self.out_attn_res_norm is not None and self.out_attn_res_proj is not None:
+                h_final = gpu_res_mix(cur[-1:], [b[-1:] for b in bres], self.out_attn_res_norm, self.out_attn_res_proj)
+            else:
+                h_final = cur[-1:]
+            h_last = gpu_rmsnorm(h_final, self.final_norm_w)
+            logits = (h_last.to(device=self.lm_head_w.device, dtype=self.lm_head_w.dtype) @ self.lm_head_w.T).float().squeeze(0)
         return logits
 
     @torch.no_grad()

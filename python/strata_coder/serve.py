@@ -11,8 +11,12 @@ Usage:
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
+from pathlib import Path
 import subprocess
+import sys
 import time
+import traceback
 from typing import Any, Dict, List
 import torch
 from .engine import KimiCoderEngine
@@ -141,33 +145,50 @@ async function sendMsg(ev){
   aDiv.appendChild(tDiv); aDiv.appendChild(cDiv); box.appendChild(aDiv);
   box.scrollTop = box.scrollHeight;
   let fullContent = '';
-  const resp = await fetch('/v1/chat/completions', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({messages:hist, stream:true, max_tokens:512})
-  });
-  const reader = resp.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
-  while(true){
-    const {done, value} = await reader.read();
-    if(done) break;
-    buf += dec.decode(value, {stream:true});
-    const lines = buf.split('\\n');
-    buf = lines.pop();
-    for(const line of lines){
-      if(!line.startsWith('data: ')) continue;
-      const payload = line.slice(6).trim();
-      if(payload === '[DONE]') break;
-      try {
-        const j = JSON.parse(payload);
-        const delta = j.choices[0].delta || {};
-        if(delta.reasoning_content){ tDiv.style.display = 'block'; tDiv.textContent += delta.reasoning_content; }
-        if(delta.content){ fullContent += delta.content; cDiv.textContent = fullContent; }
-        box.scrollTop = box.scrollHeight;
-      } catch(e){}
+  try {
+    const resp = await fetch('/v1/chat/completions', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({messages:hist, stream:true, max_tokens:512})
+    });
+    if(!resp.ok){
+      const errTxt = await resp.text();
+      cDiv.textContent = '[HTTP ' + resp.status + '] ' + errTxt;
+      hist.pop();
+      pollMonitor();
+      return;
     }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while(true){
+      const {done, value} = await reader.read();
+      if(done) break;
+      buf += dec.decode(value, {stream:true});
+      const lines = buf.split('\\n');
+      buf = lines.pop();
+      for(const line of lines){
+        if(!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        if(payload === '[DONE]') break;
+        try {
+          const j = JSON.parse(payload);
+          const delta = j.choices[0].delta || {};
+          if(delta.reasoning_content){ tDiv.style.display = 'block'; tDiv.textContent += delta.reasoning_content; }
+          if(delta.content){ fullContent += delta.content; cDiv.textContent = fullContent; }
+          box.scrollTop = box.scrollHeight;
+        } catch(e){}
+      }
+    }
+    if(fullContent && !fullContent.includes('[Server Error:')){
+      hist.push({role:'assistant', content:fullContent});
+    } else {
+      if(!fullContent) cDiv.textContent = '[Empty response from server — check server log]';
+      hist.pop();
+    }
+  } catch(e){
+    cDiv.textContent = fullContent || ('[Connection Error: ' + e + ']');
+    hist.pop();
   }
-  hist.push({role:'assistant', content:fullContent});
   pollMonitor();
 }
 </script>
@@ -243,7 +264,11 @@ def make_handler(engine: KimiCoderEngine, default_max_tokens: int):
         ram_exp = sum(len(m.ram_cache) for m in engine.layer_managers.values()) + int(ps.get("ram_experts", 0))
         vram_exp_gb = sum(m.vram_used_bytes for m in engine.layer_managers.values()) / (1024 ** 3) + float(ps.get("vram_used_gb", 0.0))
         ram_exp_gb = sum(m.ram_used_bytes for m in engine.layer_managers.values()) / (1024 ** 3) + float(ps.get("ram_used_gb", 0.0))
-        vram_alloc = (torch.cuda.memory_allocated(0) / (1024 ** 3)) if torch.cuda.is_available() else 0.0
+        vram_alloc = (
+            sum(torch.cuda.memory_allocated(i) for i in range(torch.cuda.device_count())) / (1024 ** 3)
+            if torch.cuda.is_available()
+            else 0.0
+        )
         m_raw = str(engine.model_id_or_dir)
         m_disp = Path(m_raw).name if os.path.exists(m_raw) else m_raw
         return {
@@ -360,60 +385,90 @@ def make_handler(engine: KimiCoderEngine, default_max_tokens: int):
             t0 = time.time()
             t_first = None
             tok_cnt = 0
+            headers_sent = False
 
-            if stream:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                in_think = False
-                for piece in engine.generate_stream(
-                    messages, max_new_tokens=max_tokens, temperature=temperature, reasoning_effort=reasoning_effort
-                ):
-                    now = time.time()
-                    if t_first is None:
-                        t_first = now
-                        state["prefill_tps"] = round(32.0 / max(t_first - t0, 1e-3), 1)
-                    tok_cnt += 1
-                    state["decode_tps"] = round(tok_cnt / max(now - (t_first or t0), 1e-3), 2)
-                    if "<think>" in piece:
-                        in_think = True
-                        piece = piece.replace("<think>", "")
-                    if "</think>" in piece:
-                        in_think = False
-                        piece = piece.replace("</think>", "")
-                    if not piece:
-                        continue
-                    delta = {"reasoning_content": piece} if in_think else {"content": piece}
-                    chunk = {"choices": [{"index": 0, "delta": delta}]}
-                    self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+            try:
+                if stream:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    headers_sent = True
+                    in_think = False
+                    for piece in engine.generate_stream(
+                        messages, max_new_tokens=max_tokens, temperature=temperature, reasoning_effort=reasoning_effort
+                    ):
+                        now = time.time()
+                        if t_first is None:
+                            t_first = now
+                            state["prefill_tps"] = round(32.0 / max(t_first - t0, 1e-3), 1)
+                        tok_cnt += 1
+                        state["decode_tps"] = round(tok_cnt / max(now - (t_first or t0), 1e-3), 2)
+                        if "<think>" in piece:
+                            in_think = True
+                            piece = piece.replace("<think>", "")
+                        if "</think>" in piece:
+                            in_think = False
+                            piece = piece.replace("</think>", "")
+                        if not piece:
+                            continue
+                        delta = {"reasoning_content": piece} if in_think else {"content": piece}
+                        chunk = {"choices": [{"index": 0, "delta": delta}]}
+                        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-                self.close_connection = True
-            else:
-                pieces = list(engine.generate_stream(
-                    messages, max_new_tokens=max_tokens, temperature=temperature, reasoning_effort=reasoning_effort
-                ))
-                tok_cnt = len(pieces)
-                out_text = "".join(p.replace("<think>", "").replace("</think>", "") for p in pieces)
-                resp = {
-                    "id": "chatcmpl-strata",
-                    "object": "chat.completion",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": out_text}, "finish_reason": "stop"}],
-                }
-                raw = json.dumps(resp).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
+                    self.close_connection = True
+                else:
+                    pieces = list(engine.generate_stream(
+                        messages, max_new_tokens=max_tokens, temperature=temperature, reasoning_effort=reasoning_effort
+                    ))
+                    tok_cnt = len(pieces)
+                    out_text = "".join(p.replace("<think>", "").replace("</think>", "") for p in pieces)
+                    resp = {
+                        "id": "chatcmpl-strata",
+                        "object": "chat.completion",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": out_text}, "finish_reason": "stop"}],
+                    }
+                    raw = json.dumps(resp).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    headers_sent = True
+                    self.wfile.write(raw)
 
-            dur = max(time.time() - t0, 1e-3)
-            tps = round(tok_cnt / max(time.time() - (t_first or t0), 1e-3), 2)
-            state["decode_tps"] = tps
-            state["phase"] = "Idle"
-            state["requests"].insert(0, {"time": time.strftime("%H:%M:%S"), "tokens": tok_cnt, "tps": tps, "dur": dur})
+                dur = max(time.time() - t0, 1e-3)
+                tps = round(tok_cnt / max(time.time() - (t_first or t0), 1e-3), 2)
+                state["decode_tps"] = tps
+                state["requests"].insert(0, {"time": time.strftime("%H:%M:%S"), "tokens": tok_cnt, "tps": tps, "dur": dur})
+            except Exception as exc:
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
+                for mgr in getattr(engine, "layer_managers", {}).values():
+                    if hasattr(mgr, "release_transient_gpu_cache"):
+                        mgr.release_transient_gpu_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                err_msg = f"{type(exc).__name__}: {exc}"
+                try:
+                    if stream and headers_sent:
+                        err_chunk = {"choices": [{"index": 0, "delta": {"content": f"\n[Server Error: {err_msg}]"}}]}
+                        self.wfile.write(f"data: {json.dumps(err_chunk)}\n\n".encode("utf-8"))
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                        self.close_connection = True
+                    elif not headers_sent:
+                        raw = json.dumps({"error": {"message": err_msg, "type": type(exc).__name__}}).encode("utf-8")
+                        self.send_response(500)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                except OSError:
+                    pass
+            finally:
+                state["phase"] = "Idle"
 
     return ChatHandler
 
